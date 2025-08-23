@@ -75,7 +75,7 @@ python client.py
 客户端会与服务端完成六次握手，建立安全通道，然后可发送加密消息。
 
 ### 6次握手示意图
-[6次握手示意图](mermaid.png)
+![img](mermaid.png)
 
 ---
 
