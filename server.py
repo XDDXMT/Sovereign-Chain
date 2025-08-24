@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
-
+import secrets
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -133,8 +133,9 @@ class Session:
         self.send_base_key = send_key
         self.recv_base_key = recv_key
         self.seed_code = seed_code
-        self.send_seq = 0
-        self.recv_seq = 0
+        # ==== 修复：序列号从1开始 ====
+        self.send_seq = 1  # 初始为1
+        self.recv_seq = 1  # 初始为1
         self.send_label = b"server->client"
         self.recv_label = b"client->server"
 
@@ -305,23 +306,19 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
 
         # ==== 新增：生成并发送种子码 ====
         logger.info(f"Step 12/12: Sending SeedCode to {addr}")
-        seed_code = os.urandom(32)  # 32字节种子码
-        # ==== 修复：使用临时密钥加密种子码 ====
-        logger.info(f"Step 12/12: Encrypting and sending SeedCode to {addr}")
+        # ==== 修复：添加seed_payload定义 ====
+        seed_nonce = os.urandom(8)
+        seed_code = os.urandom(32) + secrets.token_bytes(32)  # 64字节高熵种子码
+        seed_payload = b"SEEDCODE|" + seed_nonce + seed_code
 
-        # 创建临时AEAD实例（使用握手阶段生成的临时密钥）
+        # ==== 修复：完整加密消息类型 ====
         temp_aead = ChaCha20Poly1305(k_s2c)
+        temp_nonce = transcript[:12]
+        aad_data = transcript  # 只使用 transcript 作为关联数据
+        encrypted_payload = temp_aead.encrypt(temp_nonce, seed_payload, aad_data)
 
-        # 使用临时nonce（基于当前transcript哈希）
-        temp_nonce = transcript[:12]  # 取transcript前12字节作为nonce
-
-        # 加密种子码
-        enc_seed = temp_aead.encrypt(temp_nonce, seed_code, transcript)
-
-        # 发送加密后的种子码
-        seed_msg = b"SEEDCODE|" + enc_seed
-        conn.sendall(pack(seed_msg))
-        transcript_hash.update(seed_msg)
+        conn.sendall(pack(encrypted_payload))
+        transcript_hash.update(encrypted_payload)
         transcript = transcript_hash.copy().finalize()
 
         logger.info(f"Step 13/13: Waiting for ClientAuth from {addr}")
@@ -366,46 +363,63 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
 
         # 后续加密通信（示例 echo）
         while True:
-            # 接收并处理数据帧
-            frm = recv_frame(conn)
-            if not frm.startswith(b"DATA|"):
-                logger.warning(f"Received non-DATA frame from {addr}, closing connection")
-                break
-
-            # 提取序列号和密文
-            parts = frm.split(b"|", 2)
-            if len(parts) < 3:
-                logger.warning(f"Invalid DATA frame format from {addr}")
-                break
-
-            header = parts[1]
-            if len(header) != 8:  # 序列号应为8字节
-                logger.warning(f"Invalid header length from {addr}")
-                break
-
             try:
-                recv_seq = struct.unpack(">Q", header)[0]  # 大端序的64位序列号
-            except struct.error:
-                logger.warning(f"Invalid header format from {addr}")
+                frm = recv_frame(conn)
+            except ConnectionError as e:
+                logger.error(f"Connection error with {addr}: {str(e)}")
                 break
 
-            ct = parts[2]
+            # ==== 修复：解析帧 ====
+            def parse_frame(frame):
+                """严格帧解析器"""
+                try:
+                    if frame.startswith(b"DATA"):
+                        if len(frame) < 12:  # 4字节前缀 + 8字节序列号
+                            return None
+                        seq_bytes = frame[4:12]
+                        seq = struct.unpack(">Q", seq_bytes)[0]
+                        ct = frame[12:]
+                        return ("DATA", seq, ct)
+                    return None
+                except:
+                    return None
 
-            # ==== 修复：添加序列号连续性检查 ====
+            parsed = parse_frame(frm)
+            if not parsed:
+                logger.warning(f"Invalid frame format from {addr}")
+                break
+
+            frame_type, recv_seq, ct = parsed
+
+            # ==== 修复：序列号检查 ====
             if recv_seq != sess.recv_seq:
-                logger.warning(f"Sequence number mismatch from {addr}: "
-                               f"expected {sess.recv_seq}, got {recv_seq}")
-                raise SequenceError("Sequence number validation failed")
+                logger.warning(f"Sequence number mismatch from {addr}: expected {sess.recv_seq}, got {recv_seq}")
+                break
 
             try:
                 pt = sess.decrypt(ct)
             except Exception as e:
                 logger.error(f"Decryption error from {addr}: {str(e)}")
                 break
+
             logger.info(f"Received from {addr}: {pt}")
-            # 回显
+
+            # ==== 修复：添加序列号到响应 ====
+            # 获取当前发送序列号
+            current_seq = sess.send_seq
+            # 序列号编码为8字节大端序
+            header = struct.pack(">Q", current_seq)
+            # 加密响应
             resp = b"echo: " + pt
-            conn.sendall(pack(b"DATA|" + sess.encrypt(resp)))
+            ct_resp = sess.encrypt(resp)
+            # 构建响应帧
+            data_frame = b"DATA" + header + ct_resp
+            # 发送响应
+            try:
+                conn.sendall(pack(data_frame))
+            except Exception as e:
+                logger.error(f"Failed to send response to {addr}: {str(e)}")
+                break
 
     except socket.timeout:
         logger.error(f"Handshake timeout with {addr}")

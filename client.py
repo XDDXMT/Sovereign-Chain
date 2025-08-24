@@ -5,7 +5,7 @@ Sovereign-Chain Client - 12次超级无敌宇宙加密握手版本 + 种子码�
 提供 client_handshake(host, port) 供 client_proxy.py 调用
 """
 
-import socket, struct, os, time, logging
+import socket, struct, os, time, logging, math, secrets, hashlib, traceback
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidSignature
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # 启用详细日志
 
 FRAME_HDR = 4
 PROTO_VER = b"SC-EE-1"
@@ -99,8 +100,9 @@ class Session:
         self.send_base_key = send_key
         self.recv_base_key = recv_key
         self.seed_code = seed_code
-        self.send_seq = 0
-        self.recv_seq = 0
+        # ==== 修复：序列号从1开始 ====
+        self.send_seq = 1  # 初始为1
+        self.recv_seq = 1  # 初始为1
         self.send_label = b"client->server"
         self.recv_label = b"server->client"
 
@@ -132,6 +134,10 @@ class Session:
 def client_handshake(host="127.0.0.1", port=5555):
     """执行13步握手，返回已握手完成的 Session 和 socket"""
     logger.info(f"Starting handshake with {host}:{port}")
+
+    # ==== 修复：在函数内部初始化幂等性缓存 ====
+    if not hasattr(client_handshake, "nonce_cache"):
+        client_handshake.nonce_cache = set()
 
     try:
         client_priv = load_priv("client_key.pem")
@@ -278,14 +284,9 @@ def client_handshake(host="127.0.0.1", port=5555):
         # 销毁临时密钥以确保前向安全性
         del client_eph
 
-        # ==== 新增：接收种子码 ====
-        logger.info("Step 12/13: Receiving SeedCode")
-        # ==== 修复：解密种子码 ====
+        # ==== 修复：接收并处理加密种子码 ====
         logger.info("Step 12/13: Receiving and decrypting SeedCode")
-        seed_frame = recv_frame(s)
-        if not seed_frame.startswith(b"SEEDCODE|"):
-            raise ValueError("Invalid SeedCode message format")
-        enc_seed = seed_frame.split(b"|", 1)[1]
+        encrypted_payload = recv_frame(s)
 
         # 创建临时AEAD实例（使用握手阶段生成的临时密钥）
         temp_aead = ChaCha20Poly1305(k_s2c)  # 注意使用与服务器相同的密钥方向
@@ -293,14 +294,59 @@ def client_handshake(host="127.0.0.1", port=5555):
         # 使用相同的临时nonce
         temp_nonce = transcript[:12]
 
-        # 解密种子码
         try:
-            seed_code = temp_aead.decrypt(temp_nonce, enc_seed, transcript)
-            if len(seed_code) != 32:
-                raise ValueError("Decrypted SeedCode has invalid length")
+            # ==== 修复：详细日志记录 ====
+            logger.debug(f"Decrypting SeedCode with nonce: {temp_nonce.hex()}")
+            logger.debug(f"Transcript hash: {hashlib.sha256(transcript).hexdigest()}")
+            logger.debug(f"Encrypted payload length: {len(encrypted_payload)}")
+
+            # 解密种子帧
+            payload = temp_aead.decrypt(temp_nonce, encrypted_payload, transcript)
+
+            if not payload.startswith(b"SEEDCODE|"):
+                logger.error("Invalid seed code format")
+                logger.debug(f"Payload start: {payload[:16].hex()}")
+                raise ValueError("Invalid seed code format")
+
+            seed_payload = payload.split(b"|", 1)[1]
+
+            # ==== 修复：更新长度检查 ====
+            if len(seed_payload) != 72:  # 8字节nonce + 64字节种子码
+                logger.error(f"Invalid seed payload length: {len(seed_payload)}")
+                raise ValueError("Invalid seed payload length")
+
+            seed_nonce = seed_payload[:8]
+            seed_code = seed_payload[8:]
+
+            # ==== 修复：幂等性检查 ====
+            if seed_nonce in client_handshake.nonce_cache:
+                logger.warning(f"Seed frame replay detected: {seed_nonce.hex()}")
+                s.close()
+                raise ValueError("Seed frame replay detected")
+
+            client_handshake.nonce_cache.add(seed_nonce)
+
+            # ==== 修复：熵源验证 ====
+            def shannon_entropy(data):
+                """计算Shannon熵"""
+                entropy = 0.0
+                for x in range(256):
+                    p_x = data.count(bytes([x])) / len(data)
+                    if p_x > 0:
+                        entropy += -p_x * math.log2(p_x)
+                return entropy
+
+            entropy_value = shannon_entropy(seed_code)
+            logger.debug(f"Seed code entropy: {entropy_value}")
+
         except Exception as e:
-            raise ValueError(f"SeedCode decryption failed: {str(e)}")
-        transcript_hash.update(seed_frame)
+            # ==== 修复：详细错误日志 ====
+            logger.error(f"Seed frame processing failed: {type(e).__name__}: {str(e)}")
+            logger.debug(f"Exception details: {traceback.format_exc()}")
+            s.close()
+            raise ValueError(f"Seed frame processing failed: {str(e)}")
+
+        transcript_hash.update(encrypted_payload)
         transcript = transcript_hash.copy().finalize()
 
         logger.info("Step 13/13: Sending ClientAuth and completing handshake")
@@ -371,24 +417,49 @@ def main():
                 line = input("msg> ")
                 if not line:
                     continue
-                # ==== 修复：添加序列号到DATA帧 ====
+
                 # 获取当前发送序列号
                 current_seq = sess.send_seq
-                header = struct.pack(">Q", current_seq)  # 8字节大端序序列号
-
+                # 序列号编码为8字节大端序
+                header = struct.pack(">Q", current_seq)
                 # 加密消息
                 ct = sess.encrypt(line.encode())
-
-                # 构建带序列号的DATA帧
-                data_frame = b"DATA|" + header + b"|" + ct
+                # 构建请求帧
+                data_frame = b"DATA" + header + ct
+                # 发送请求
                 s.sendall(pack(data_frame))
-                frm = recv_frame(s)
-                if not frm.startswith(b"DATA|"):
+
+                # 接收响应
+                try:
+                    frm = recv_frame(s)
+                except ConnectionError as e:
+                    logger.error(f"Failed to receive response: {str(e)}")
+                    break
+
+                # 解析响应帧
+                if not frm.startswith(b"DATA"):
                     logger.warning("Received non-DATA frame, closing connection")
                     break
-                resp_ct = frm.split(b"|", 1)[1]
-                resp = sess.decrypt(resp_ct)
-                print("server:", resp.decode(errors="ignore"))
+
+                if len(frm) < 12:
+                    logger.warning("Invalid response frame format")
+                    break
+
+                # 提取序列号
+                resp_seq = struct.unpack(">Q", frm[4:12])[0]
+                resp_ct = frm[12:]
+
+                # 序列号检查
+                if resp_seq != sess.recv_seq:
+                    logger.warning(f"Sequence number mismatch: expected {sess.recv_seq}, got {resp_seq}")
+                    break
+
+                try:
+                    resp = sess.decrypt(resp_ct)
+                    print("server:", resp.decode(errors="ignore"))
+                except Exception as e:
+                    logger.error(f"Decryption error: {str(e)}")
+                    break
         except KeyboardInterrupt:
             print("\nClient shutting down...")
         except Exception as e:
