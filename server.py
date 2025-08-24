@@ -28,6 +28,10 @@ nonce_cache_lock = threading.Lock()
 NONCE_CACHE_MAX_SIZE = 10000
 NONCE_CACHE_EXPIRE = 300  # 5分钟
 
+# 在 Session 类上方添加新的异常类
+class SequenceError(Exception):
+    """序列号验证失败异常"""
+    pass
 
 def pack(buf: bytes) -> bytes:
     return struct.pack(">I", len(buf)) + buf
@@ -302,7 +306,20 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
         # ==== 新增：生成并发送种子码 ====
         logger.info(f"Step 12/12: Sending SeedCode to {addr}")
         seed_code = os.urandom(32)  # 32字节种子码
-        seed_msg = b"SEEDCODE|" + seed_code
+        # ==== 修复：使用临时密钥加密种子码 ====
+        logger.info(f"Step 12/12: Encrypting and sending SeedCode to {addr}")
+
+        # 创建临时AEAD实例（使用握手阶段生成的临时密钥）
+        temp_aead = ChaCha20Poly1305(k_s2c)
+
+        # 使用临时nonce（基于当前transcript哈希）
+        temp_nonce = transcript[:12]  # 取transcript前12字节作为nonce
+
+        # 加密种子码
+        enc_seed = temp_aead.encrypt(temp_nonce, seed_code, transcript)
+
+        # 发送加密后的种子码
+        seed_msg = b"SEEDCODE|" + enc_seed
         conn.sendall(pack(seed_msg))
         transcript_hash.update(seed_msg)
         transcript = transcript_hash.copy().finalize()
@@ -349,11 +366,37 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
 
         # 后续加密通信（示例 echo）
         while True:
+            # 接收并处理数据帧
             frm = recv_frame(conn)
             if not frm.startswith(b"DATA|"):
                 logger.warning(f"Received non-DATA frame from {addr}, closing connection")
                 break
-            ct = frm.split(b"|", 1)[1]
+
+            # 提取序列号和密文
+            parts = frm.split(b"|", 2)
+            if len(parts) < 3:
+                logger.warning(f"Invalid DATA frame format from {addr}")
+                break
+
+            header = parts[1]
+            if len(header) != 8:  # 序列号应为8字节
+                logger.warning(f"Invalid header length from {addr}")
+                break
+
+            try:
+                recv_seq = struct.unpack(">Q", header)[0]  # 大端序的64位序列号
+            except struct.error:
+                logger.warning(f"Invalid header format from {addr}")
+                break
+
+            ct = parts[2]
+
+            # ==== 修复：添加序列号连续性检查 ====
+            if recv_seq != sess.recv_seq:
+                logger.warning(f"Sequence number mismatch from {addr}: "
+                               f"expected {sess.recv_seq}, got {recv_seq}")
+                raise SequenceError("Sequence number validation failed")
+
             try:
                 pt = sess.decrypt(ct)
             except Exception as e:

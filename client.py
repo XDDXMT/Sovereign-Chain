@@ -280,12 +280,26 @@ def client_handshake(host="127.0.0.1", port=5555):
 
         # ==== 新增：接收种子码 ====
         logger.info("Step 12/13: Receiving SeedCode")
+        # ==== 修复：解密种子码 ====
+        logger.info("Step 12/13: Receiving and decrypting SeedCode")
         seed_frame = recv_frame(s)
         if not seed_frame.startswith(b"SEEDCODE|"):
             raise ValueError("Invalid SeedCode message format")
-        seed_code = seed_frame.split(b"|", 1)[1]
-        if len(seed_code) != 32:
-            raise ValueError("Invalid SeedCode length")
+        enc_seed = seed_frame.split(b"|", 1)[1]
+
+        # 创建临时AEAD实例（使用握手阶段生成的临时密钥）
+        temp_aead = ChaCha20Poly1305(k_s2c)  # 注意使用与服务器相同的密钥方向
+
+        # 使用相同的临时nonce
+        temp_nonce = transcript[:12]
+
+        # 解密种子码
+        try:
+            seed_code = temp_aead.decrypt(temp_nonce, enc_seed, transcript)
+            if len(seed_code) != 32:
+                raise ValueError("Decrypted SeedCode has invalid length")
+        except Exception as e:
+            raise ValueError(f"SeedCode decryption failed: {str(e)}")
         transcript_hash.update(seed_frame)
         transcript = transcript_hash.copy().finalize()
 
@@ -357,7 +371,17 @@ def main():
                 line = input("msg> ")
                 if not line:
                     continue
-                s.sendall(pack(b"DATA|" + sess.encrypt(line.encode())))
+                # ==== 修复：添加序列号到DATA帧 ====
+                # 获取当前发送序列号
+                current_seq = sess.send_seq
+                header = struct.pack(">Q", current_seq)  # 8字节大端序序列号
+
+                # 加密消息
+                ct = sess.encrypt(line.encode())
+
+                # 构建带序列号的DATA帧
+                data_frame = b"DATA|" + header + b"|" + ct
+                s.sendall(pack(data_frame))
                 frm = recv_frame(s)
                 if not frm.startswith(b"DATA|"):
                     logger.warning("Received non-DATA frame, closing connection")
