@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # server.py
 """
-Sovereign-Chain Server - 12次超级无敌宇宙加密握手版本
+Sovereign-Chain Server - 12次超级无敌宇宙加密握手版本 + 种子码动态加密
 """
 
 import socket, struct, os, threading, time, logging
@@ -125,22 +125,36 @@ def check_nonce_replay(nonce, addr):
 
 
 class Session:
-    def __init__(self, send_key, recv_key):
-        self.send_aead = ChaCha20Poly1305(send_key)
-        self.recv_aead = ChaCha20Poly1305(recv_key)
+    def __init__(self, send_key, recv_key, seed_code):
+        self.send_base_key = send_key
+        self.recv_base_key = recv_key
+        self.seed_code = seed_code
         self.send_seq = 0
         self.recv_seq = 0
         self.send_label = b"server->client"
         self.recv_label = b"client->server"
 
+    def _derive_key(self, base_key, seq, label):
+        """使用种子码和序列号派生动态密钥"""
+        info = self.seed_code + struct.pack(">Q", seq) + label
+        return hkdf(base_key, info, length=32)
+
     def encrypt(self, pt: bytes, aad: bytes = b""):
+        # 派生本次消息的动态密钥
+        dynamic_key = self._derive_key(self.send_base_key, self.send_seq, self.send_label)
+        aead = ChaCha20Poly1305(dynamic_key)
+
         n = nonce_from_seq(self.send_seq, self.send_label)
         self.send_seq += 1
-        return self.send_aead.encrypt(n, pt, aad)
+        return aead.encrypt(n, pt, aad)
 
     def decrypt(self, ct: bytes, aad: bytes = b""):
+        # 派生本次消息的动态密钥
+        dynamic_key = self._derive_key(self.recv_base_key, self.recv_seq, self.recv_label)
+        aead = ChaCha20Poly1305(dynamic_key)
+
         n = nonce_from_seq(self.recv_seq, self.recv_label)
-        pt = self.recv_aead.decrypt(n, ct, aad)
+        pt = aead.decrypt(n, ct, aad)
         self.recv_seq += 1
         return pt
 
@@ -285,7 +299,15 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
         # 销毁临时密钥以确保前向安全性
         del server_eph
 
-        logger.info(f"Step 12/12: Waiting for ClientAuth from {addr}")
+        # ==== 新增：生成并发送种子码 ====
+        logger.info(f"Step 12/12: Sending SeedCode to {addr}")
+        seed_code = os.urandom(32)  # 32字节种子码
+        seed_msg = b"SEEDCODE|" + seed_code
+        conn.sendall(pack(seed_msg))
+        transcript_hash.update(seed_msg)
+        transcript = transcript_hash.copy().finalize()
+
+        logger.info(f"Step 13/13: Waiting for ClientAuth from {addr}")
         # 10) ClientAuth: client signature over transcript
         caut = recv_frame(conn)
         if not caut.startswith(b"CLIENTAUTH|"):
@@ -314,12 +336,13 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
         transcript = transcript_hash.copy().finalize()
 
         # 12) SecureAck: encrypted "ACK"
-        sess = Session(send_key=k_s2c, recv_key=k_c2s)
+        # 使用种子码创建会话
+        sess = Session(send_key=k_s2c, recv_key=k_c2s, seed_code=seed_code)
         ct = sess.encrypt(b"ACK", aad=transcript)
         conn.sendall(pack(b"SECUREACK|" + ct))
 
         handshake_time = time.time() - handshake_start_time
-        logger.info(f"12次握手完成 with {addr} (耗时: {handshake_time:.2f}s)")
+        logger.info(f"13次握手完成 with {addr} (耗时: {handshake_time:.2f}s)")
 
         # 重置超时设置
         conn.settimeout(None)

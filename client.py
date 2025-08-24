@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # client.py
 """
-Sovereign-Chain Client - 12次超级无敌宇宙加密握手版本
+Sovereign-Chain Client - 12次超级无敌宇宙加密握手版本 + 种子码动态加密
 提供 client_handshake(host, port) 供 client_proxy.py 调用
 """
 
@@ -95,28 +95,42 @@ def nonce_from_seq(seq: int, label: bytes):
 
 
 class Session:
-    def __init__(self, send_key, recv_key):
-        self.send_aead = ChaCha20Poly1305(send_key)
-        self.recv_aead = ChaCha20Poly1305(recv_key)
+    def __init__(self, send_key, recv_key, seed_code):
+        self.send_base_key = send_key
+        self.recv_base_key = recv_key
+        self.seed_code = seed_code
         self.send_seq = 0
         self.recv_seq = 0
         self.send_label = b"client->server"
         self.recv_label = b"server->client"
 
+    def _derive_key(self, base_key, seq, label):
+        """使用种子码和序列号派生动态密钥"""
+        info = self.seed_code + struct.pack(">Q", seq) + label
+        return hkdf(base_key, info, length=32)
+
     def encrypt(self, pt, aad=b""):
+        # 派生本次消息的动态密钥
+        dynamic_key = self._derive_key(self.send_base_key, self.send_seq, self.send_label)
+        aead = ChaCha20Poly1305(dynamic_key)
+
         n = nonce_from_seq(self.send_seq, self.send_label)
         self.send_seq += 1
-        return self.send_aead.encrypt(n, pt, aad)
+        return aead.encrypt(n, pt, aad)
 
     def decrypt(self, ct, aad=b""):
+        # 派生本次消息的动态密钥
+        dynamic_key = self._derive_key(self.recv_base_key, self.recv_seq, self.recv_label)
+        aead = ChaCha20Poly1305(dynamic_key)
+
         n = nonce_from_seq(self.recv_seq, self.recv_label)
-        pt = self.recv_aead.decrypt(n, ct, aad)
+        pt = aead.decrypt(n, ct, aad)
         self.recv_seq += 1
         return pt
 
 
 def client_handshake(host="127.0.0.1", port=5555):
-    """执行12步握手，返回已握手完成的 Session 和 socket"""
+    """执行13步握手，返回已握手完成的 Session 和 socket"""
     logger.info(f"Starting handshake with {host}:{port}")
 
     try:
@@ -137,7 +151,7 @@ def client_handshake(host="127.0.0.1", port=5555):
     transcript_hash = hashes.Hash(hashes.SHA256(), backend=default_backend())
 
     try:
-        logger.info("Step 1/12: Sending ClientHello")
+        logger.info("Step 1/13: Sending ClientHello")
         # 1) CLIENTHELLO
         client_eph = x25519.X25519PrivateKey.generate()
         client_eph_pub = client_eph.public_key().public_bytes(
@@ -150,7 +164,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(ch)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 2/12: Waiting for ServerHello")
+        logger.info("Step 2/13: Waiting for ServerHello")
         # 2) SERVERHELLO
         sh = recv_frame(s)
         if not sh.startswith(b"SERVERHELLO|"):
@@ -164,7 +178,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(sh)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 3/12: Waiting for ServerCertSend")
+        logger.info("Step 3/13: Waiting for ServerCertSend")
         # 3) SERVERCERTSEND
         scert = recv_frame(s)
         if not scert.startswith(b"SERVERCERTSEND|"):
@@ -177,7 +191,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(scert)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 4/12: Verifying server certificate")
+        logger.info("Step 4/13: Verifying server certificate")
         # 验证服务器证书
         ca_pub = ca_cert.public_key()
         try:
@@ -196,7 +210,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         except Exception as e:
             raise ValueError(f"Server certificate verification failed: {str(e)}")
 
-        logger.info("Step 5/12: Waiting for ClientCertRequest")
+        logger.info("Step 5/13: Waiting for ClientCertRequest")
         # 4) CLIENTCERTREQUEST
         ccr = recv_frame(s)
         if not ccr.startswith(b"CLIENTCERTREQUEST|"):
@@ -204,14 +218,14 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(ccr)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 6/12: Sending ClientCertSend")
+        logger.info("Step 6/13: Sending ClientCertSend")
         # 5) CLIENTCERTSEND
         ccert_fr = b"CLIENTCERTSEND|" + client_cert.public_bytes(serialization.Encoding.PEM)
         s.sendall(pack(ccert_fr))
         transcript_hash.update(ccert_fr)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 7/12: Waiting for KeyExchange1")
+        logger.info("Step 7/13: Waiting for KeyExchange1")
         # 6) KEYEXCHANGE1
         ke1 = recv_frame(s)
         if not ke1.startswith(b"KEYEXCHANGE1|"):
@@ -222,7 +236,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(ke1)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 8/12: Sending KeyExchange2")
+        logger.info("Step 8/13: Sending KeyExchange2")
         # 7) KEYEXCHANGE2
         ke2_data = os.urandom(32)
         ke2 = b"KEYEXCHANGE2|" + ke2_data
@@ -230,7 +244,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(ke2)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 9/12: Waiting for KeyConfirm1")
+        logger.info("Step 9/13: Waiting for KeyConfirm1")
         # 8) KEYCONFIRM1
         kc1 = recv_frame(s)
         if not kc1.startswith(b"KEYCONFIRM1|"):
@@ -241,7 +255,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(kc1)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 10/12: Sending KeyConfirm2")
+        logger.info("Step 10/13: Sending KeyConfirm2")
         # 9) KEYCONFIRM2
         kc2_data = os.urandom(32)
         kc2 = b"KEYCONFIRM2|" + kc2_data
@@ -249,7 +263,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript_hash.update(kc2)
         transcript = transcript_hash.copy().finalize()
 
-        logger.info("Step 11/12: Calculating shared key")
+        logger.info("Step 11/13: Calculating shared key")
         # 计算共享密钥（包含额外的密钥交换数据）
         shared = client_eph.exchange(x25519.X25519PublicKey.from_public_bytes(server_eph_pub))
 
@@ -264,7 +278,18 @@ def client_handshake(host="127.0.0.1", port=5555):
         # 销毁临时密钥以确保前向安全性
         del client_eph
 
-        logger.info("Step 12/12: Sending ClientAuth and completing handshake")
+        # ==== 新增：接收种子码 ====
+        logger.info("Step 12/13: Receiving SeedCode")
+        seed_frame = recv_frame(s)
+        if not seed_frame.startswith(b"SEEDCODE|"):
+            raise ValueError("Invalid SeedCode message format")
+        seed_code = seed_frame.split(b"|", 1)[1]
+        if len(seed_code) != 32:
+            raise ValueError("Invalid SeedCode length")
+        transcript_hash.update(seed_frame)
+        transcript = transcript_hash.copy().finalize()
+
+        logger.info("Step 13/13: Sending ClientAuth and completing handshake")
         # 10) CLIENTAUTH: sign transcript
         sig_client = client_priv.sign(transcript)
         auth_msg = b"CLIENTAUTH|" + sig_client
@@ -295,7 +320,8 @@ def client_handshake(host="127.0.0.1", port=5555):
         if not ack_fr.startswith(b"SECUREACK|"):
             raise ValueError("Invalid SecureAck message format")
         ct = ack_fr.split(b"|", 1)[1]
-        sess = Session(send_key=k_c2s, recv_key=k_s2c)
+        # 使用种子码创建会话
+        sess = Session(send_key=k_c2s, recv_key=k_s2c, seed_code=seed_code)
 
         # 验证ACK
         try:
