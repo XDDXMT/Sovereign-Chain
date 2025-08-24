@@ -121,13 +121,13 @@ python client_proxy.py
 
 ## 使用示例
 
-
+```
 client> hello server
 server: echo: hello server
 
 client> test123
 server: echo: test123
-
+```
 
 所有消息都经过端到端加密和种子码二次加密，服务端无法篡改内容，客户端与服务端可互相验证身份。
 在代理模式下，客户端与真实服务器之间仍保持完整加密和身份验证。
