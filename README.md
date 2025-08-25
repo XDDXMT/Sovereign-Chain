@@ -164,10 +164,10 @@ sequenceDiagram
 ## 使用示例
 
 ```
-client> hello server
+msg> hello server
 server: echo: hello server
 
-client> test123
+msg> test123
 server: echo: test123
 ```
 
