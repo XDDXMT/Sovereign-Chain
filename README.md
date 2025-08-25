@@ -140,14 +140,14 @@ sequenceDiagram
     Server->>Client: 3. SERVERCERTSEND (server_cert PEM)
     Server->>Client: 4. CLIENTCERTREQUEST
     Client->>Server: 5. CLIENTCERTSEND (client_cert PEM)
-    Client->>Server: 6. KEYEXCHANGE1 (extra data 1, 32-byte seed)
+    Client->>Server: 6. SEEDCODE 
     Note over Client, Server: 基于种子码随机排列以下4步顺序 (24种可能)
     rect rgba(0, 255, 0, 0.1)
-        Note over Client, Server: 随机顺序区域
-        Server-->>Client: 7. [随机步骤1] (KEYEXCHANGE2 / KEYCONFIRM1 / KEYCONFIRM2 / SEEDCODE)
-        Server-->>Client: 8. [随机步骤2] (剩余3步随机)
-        Server-->>Client: 9. [随机步骤3] (剩余2步随机)
-        Server-->>Client: 10. [随机步骤4] (最后1步)
+        Note over Client, Server: 以下为1.2.5.4更新前标准顺序，但更新后不保证每次都一样
+        Server-->>Client: 7. KeyExchange1 (extra data 1)
+        Client-->>Server: 8. KeyExchange2 (extra data 2)
+        Server-->>Client: 9. KeyConfirm1 (confirm data 1)
+        Client-->>Server: 10. KeyConfirm2 (confirm data 2)
     end
     Client->>Server: 11. CLIENTAUTH (signature over transcript)
     Server->>Client: 12. SERVERAUTH (signature over transcript)
