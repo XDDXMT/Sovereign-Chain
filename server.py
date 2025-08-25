@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # server.py
 """
-Sovereign-Chain Server - 安全加固版本
-修复所有安全审查问题
+Sovereign-Chain Server - 支持匿名客户端
 """
 
 import socket, struct, os, threading, time, logging, math, secrets
@@ -130,6 +129,18 @@ def load_ca_cert():
             )
     except Exception as e:
         raise ValueError(f"failed to load CA certificate: {str(e)}")
+
+
+def load_anonymous_ca_cert():
+    """加载匿名CA证书"""
+    try:
+        with open("anonymous_ca_cert.pem", "rb") as f:
+            return x509.load_pem_x509_certificate(
+                f.read(),
+                backend=default_backend()
+            )
+    except Exception as e:
+        raise ValueError(f"failed to load anonymous CA certificate: {str(e)}")
 
 
 def hkdf(ikm, info, length=64):
@@ -311,28 +322,44 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
             current_state = "CLIENTCERTSEND_RECEIVED"
 
             client_cert_pem = parse_protocol_frame(ccert_frame, b"CLIENTCERTSEND")
-            client_cert = x509.load_pem_x509_certificate(
-                client_cert_pem,
-                backend=default_backend()
-            )
+            try:
+                client_cert = x509.load_pem_x509_certificate(
+                    client_cert_pem,
+                    backend=default_backend()
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to load client certificate: {str(e)}")
             transcript_hash.update(ccert_frame)
             transcript = transcript_hash.copy().finalize()
 
             # ==== 状态6: 验证客户端证书 ====
             logger.info(f"Step 6/13: Verifying client certificate from {addr}")
-            ca_pub = ca_cert.public_key()
             try:
+                # 尝试用普通CA验证
+                ca_pub = ca_cert.public_key()
                 if not isinstance(ca_pub, ed25519.Ed25519PublicKey):
                     raise ValueError("CA public key is not Ed25519")
                 ca_pub.verify(
                     client_cert.signature,
                     client_cert.tbs_certificate_bytes
                 )
-                logger.info(f"Client certificate verified successfully for {addr}")
-            except InvalidSignature:
-                raise ValueError("client certificate signature invalid")
+                logger.info(f"Client certificate verified successfully for {addr} (using regular CA)")
+            except (InvalidSignature, ValueError):
+                # 如果普通CA验证失败，尝试用匿名CA验证
+                try:
+                    anonymous_ca_cert = load_anonymous_ca_cert()
+                    anon_ca_pub = anonymous_ca_cert.public_key()
+                    if not isinstance(anon_ca_pub, ed25519.Ed25519PublicKey):
+                        raise ValueError("Anonymous CA public key is not Ed25519")
+                    anon_ca_pub.verify(
+                        client_cert.signature,
+                        client_cert.tbs_certificate_bytes
+                    )
+                    logger.info(f"Client certificate verified successfully for {addr} (using anonymous CA)")
+                except (InvalidSignature, ValueError) as e:
+                    raise ValueError(f"Client certificate verification failed: {str(e)}")
             except Exception as e:
-                raise ValueError(f"client certificate verification failed: {str(e)}")
+                raise ValueError(f"Client certificate verification failed: {str(e)}")
 
             # ==== 状态7: 发送KeyExchange1 ====
             logger.info(f"Step 7/13: Sending KeyExchange1 to {addr}")

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # client.py
 """
-Sovereign-Chain Client - 安全加固版本
-修复所有安全审查问题
+Sovereign-Chain Client - 支持匿名模式
 """
 
 import socket, struct, os, time, logging, math, secrets, hashlib, traceback
@@ -15,6 +14,9 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 import threading
 from collections import deque
+import datetime
+import tempfile
+from cryptography.x509.oid import NameOID
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,7 +77,7 @@ def recv_frame(sock):
 
 
 def load_priv():
-    """使用本地固定路径"""
+    """尝试加载客户端私钥，如果不存在则返回None"""
     try:
         with open("client_key.pem", "rb") as f:
             return serialization.load_pem_private_key(
@@ -83,18 +85,22 @@ def load_priv():
                 password=None,
                 backend=default_backend()
             )
+    except FileNotFoundError:
+        return None
     except Exception as e:
         raise ValueError(f"Failed to load private key: {str(e)}")
 
 
 def load_cert():
-    """使用本地固定路径"""
+    """尝试加载客户端证书，如果不存在则返回None"""
     try:
         with open("client_cert.pem", "rb") as f:
             return x509.load_pem_x509_certificate(
                 f.read(),
                 backend=default_backend()
             )
+    except FileNotFoundError:
+        return None
     except Exception as e:
         raise ValueError(f"Failed to load certificate: {str(e)}")
 
@@ -109,6 +115,58 @@ def load_ca_cert():
             )
     except Exception as e:
         raise ValueError(f"Failed to load CA certificate: {str(e)}")
+
+
+def generate_temp_cert():
+    """生成临时证书和私钥"""
+    logger.info("Generating temporary certificate for anonymous connection")
+
+    # 加载匿名CA证书和私钥
+    try:
+        with open("anonymous_ca_cert.pem", "rb") as f:
+            ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+        with open("anonymous_ca_key.pem", "rb") as f:
+            ca_priv = serialization.load_pem_private_key(f.read(), None, default_backend())
+    except Exception as e:
+        raise ValueError(f"Failed to load anonymous CA: {str(e)}")
+
+    # 生成临时密钥对
+    priv_key = ed25519.Ed25519PrivateKey.generate()
+    pub_key = priv_key.public_key()
+
+    # 创建证书
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, f"Anonymous-{secrets.token_hex(8)}"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Sovereign Chain"),
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "SC")
+    ])
+
+    builder = x509.CertificateBuilder()
+    builder = builder.subject_name(subject)
+    builder = builder.issuer_name(ca_cert.subject)
+    builder = builder.public_key(pub_key)
+    builder = builder.serial_number(x509.random_serial_number())
+
+    # 修复：使用正确的UTC时间获取方式
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = builder.not_valid_before(now)
+    builder = builder.not_valid_after(now + datetime.timedelta(minutes=30))  # 短期有效
+
+    # 添加基本约束
+    builder = builder.add_extension(
+        x509.BasicConstraints(ca=False, path_length=None),
+        critical=True
+    )
+
+    # 修复：根据私钥类型选择正确的签名算法
+    if isinstance(ca_priv, ed25519.Ed25519PrivateKey):
+        # Ed25519不需要指定哈希算法
+        cert = builder.sign(ca_priv, algorithm=None)
+    else:
+        # 其他算法需要指定哈希算法
+        cert = builder.sign(ca_priv, algorithm=hashes.SHA256())
+
+    return priv_key, cert
 
 
 def hkdf(ikm, info, length=64):
@@ -201,6 +259,11 @@ def client_handshake(host="127.0.0.1", port=5555):
         client_priv = load_priv()
         client_cert = load_cert()
         ca_cert = load_ca_cert()
+
+        # 如果没有固定证书，生成临时证书
+        if client_priv is None or client_cert is None:
+            logger.info("No fixed certificate found, generating temporary certificate")
+            client_priv, client_cert = generate_temp_cert()
     except Exception as e:
         raise ConnectionError(f"Failed to load credentials: {str(e)}")
 
