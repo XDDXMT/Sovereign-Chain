@@ -20,14 +20,15 @@
   3. ServerCertSend   : 服务端发送证书 (server_cert in PEM)
   4. ClientCertRequest: 服务端请求客户端证书 ("REQUEST_CLIENT_CERT")
   5. ClientCertSend   : 客户端发送证书 (client_cert in PEM)
-  6. KeyExchange1     : 服务端发送密钥交换扩展数据
-  7. KeyExchange2     : 客户端发送密钥交换扩展数据
-  8. KeyConfirm1      : 服务端发送密钥确认数据
-  9. KeyConfirm2      : 客户端发送密钥确认数据
-  10. SeedCode        : 服务端发送32字节种子码 (核心创新点)
+  6. SeedCode        : 服务端发送32字节种子码 (核心创新点)
+  7. KeyExchange1     : 服务端发送密钥交换扩展数据
+  8. KeyExchange2     : 客户端发送密钥交换扩展数据
+  9. KeyConfirm1      : 服务端发送密钥确认数据
+  10. KeyConfirm2      : 客户端发送密钥确认数据
   11. ClientAuth      : 客户端发送握手记录签名 (signature_client(transcript_so_far))
   12. ServerAuth      : 服务端发送握手记录签名 (signature_server(transcript_so_far))
-  13. SecureAck       : 服务端发送加密的ACK（使用派生的密钥，证明密钥确认）
+  13. SecureAck       : 服务端发送加密的ACK（使用派生的密钥，证明密钥确认）  
+_步骤7（KeyExchange1）-10（KeyConfirm2）的执行顺序由步骤6中的order_seed随机决定，每次握手都可能采用不同的排列组合(共24种可能)，有效防止流量分析和中间人攻击。_
 * 🛡️ **证书管理**
 
   * 自建 CA（根 CA）
@@ -46,10 +47,23 @@
   * 可用于负载分发、调试或隐藏真实服务器地址
 * 🌱 **种子码消息级动态加密（创新）**
 
-  * 在握手阶段传输32字节种子码
+  * 在握手阶段传输64字节种子码
   * 每条消息使用种子码+计数器派生独立密钥
   * 实现真正的消息级安全隔离
   * 即使会话密钥泄露，也无法解密历史消息
+* 🎲 **随机握手（创新）**
+
+  * 步骤7（KeyExchange1）-10（KeyConfirm2）的执行顺序由步骤6中的order_seed随机决定
+  * 每次握手都可能采用不同的排列组合(共24种可能)，有效防止流量分析和中间人攻击
+```
+随机握手示例：
+2025-08-25 19:09:42,081 - INFO - Generated step order: ['KEYCONFIRM2', 'KEYEXCHANGE1', 'KEYCONFIRM1', 'KEYEXCHANGE2']
+2025-08-25 19:09:42,081 - INFO - Step 12/13: Sending KeyConfirm2
+2025-08-25 19:09:42,081 - INFO - Step 9/13: Waiting for KeyExchange1
+2025-08-25 19:09:42,081 - INFO - Step 11/13: Waiting for KeyConfirm1
+2025-08-25 19:09:42,081 - INFO - Step 10/13: Sending KeyExchange2
+```
+
 
 ---
 
