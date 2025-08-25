@@ -3,7 +3,7 @@
 """
 Sovereign-Chain Server - 支持匿名客户端
 """
-
+import random
 import socket, struct, os, threading, time, logging, math, secrets
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
@@ -13,6 +13,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 import hashlib
+import itertools
 from collections import deque
 
 # 设置日志
@@ -208,14 +209,27 @@ def parse_protocol_frame(frame, expected_type):
 
 
 class Session:
-    def __init__(self, send_key, recv_key, seed_code):
+    def __init__(self, send_key, recv_key, seed_code, role="client"):
+        """
+        初始化会话
+        :param send_key: 发送密钥
+        :param recv_key: 接收密钥
+        :param seed_code: 种子码
+        :param role: 角色 ("client" 或 "server")
+        """
         self.send_base_key = send_key
         self.recv_base_key = recv_key
         self.seed_code = seed_code
         self.send_seq = 1
         self.recv_seq = 1
-        self.send_label = b"server->client"
-        self.recv_label = b"client->server"
+
+        # 根据角色设置标签
+        if role == "client":
+            self.send_label = b"client->server"
+            self.recv_label = b"server->client"
+        else:  # server
+            self.send_label = b"server->client"
+            self.recv_label = b"client->server"
 
     def _derive_key(self, base_key, seq, label):
         """使用种子码和序列号派生动态密钥"""
@@ -223,13 +237,16 @@ class Session:
         return hkdf(base_key, info, length=32)
 
     def encrypt(self, pt: bytes, aad: bytes = b""):
+        """加密数据"""
         dynamic_key = self._derive_key(self.send_base_key, self.send_seq, self.send_label)
         aead = ChaCha20Poly1305(dynamic_key)
         n = nonce_from_seq(self.send_seq, self.send_label)
+        ct = aead.encrypt(n, pt, aad)
         self.send_seq += 1
-        return aead.encrypt(n, pt, aad)
+        return ct
 
     def decrypt(self, ct: bytes, aad: bytes = b""):
+        """解密数据"""
         dynamic_key = self._derive_key(self.recv_base_key, self.recv_seq, self.recv_label)
         aead = ChaCha20Poly1305(dynamic_key)
         n = nonce_from_seq(self.recv_seq, self.recv_label)
@@ -361,82 +378,49 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
             except Exception as e:
                 raise ValueError(f"Client certificate verification failed: {str(e)}")
 
-            # ==== 状态7: 发送KeyExchange1 ====
-            logger.info(f"Step 7/13: Sending KeyExchange1 to {addr}")
-            if current_state != "CLIENTCERTSEND_RECEIVED":
-                raise ProtocolError("Invalid state for KeyExchange1")
-            current_state = "KEYEXCHANGE1_SENT"
-
-            ke1_data = os.urandom(32)
-            ke1 = b"KEYEXCHANGE1|" + ke1_data
-            conn.sendall(pack(ke1))
-            transcript_hash.update(ke1)
-            transcript = transcript_hash.copy().finalize()
-
-            # ==== 状态8: 接收KeyExchange2 ====
-            logger.info(f"Step 8/13: Waiting for KeyExchange2 from {addr}")
-            ke2_frame = recv_frame(conn)
-            if current_state != "KEYEXCHANGE1_SENT":
-                raise ProtocolError("Invalid state for KeyExchange2")
-            current_state = "KEYEXCHANGE2_RECEIVED"
-
-            ke2_data = parse_protocol_frame(ke2_frame, b"KEYEXCHANGE2")
-            validate_field(ke2_data, 32, 32, "KeyExchange2 data", is_text=False)
-            transcript_hash.update(ke2_frame)
-            transcript = transcript_hash.copy().finalize()
-
-            # ==== 状态9: 发送KeyConfirm1 ====
-            logger.info(f"Step 9/13: Sending KeyConfirm1 to {addr}")
-            if current_state != "KEYEXCHANGE2_RECEIVED":
-                raise ProtocolError("Invalid state for KeyConfirm1")
-            current_state = "KEYCONFIRM1_SENT"
-
-            kc1_data = os.urandom(32)
-            kc1 = b"KEYCONFIRM1|" + kc1_data
-            conn.sendall(pack(kc1))
-            transcript_hash.update(kc1)
-            transcript = transcript_hash.copy().finalize()
-
-            # ==== 状态10: 接收KeyConfirm2 ====
-            logger.info(f"Step 10/13: Waiting for KeyConfirm2 from {addr}")
-            kc2_frame = recv_frame(conn)
-            if current_state != "KEYCONFIRM1_SENT":
-                raise ProtocolError("Invalid state for KeyConfirm2")
-            current_state = "KEYCONFIRM2_RECEIVED"
-
-            kc2_data = parse_protocol_frame(kc2_frame, b"KEYCONFIRM2")
-            validate_field(kc2_data, 32, 32, "KeyConfirm2 data", is_text=False)
-            transcript_hash.update(kc2_frame)
-            transcript = transcript_hash.copy().finalize()
-
-            # ==== 状态11: 计算共享密钥 ====
-            logger.info(f"Step 11/13: Calculating shared key for {addr}")
+            # ==== 状态7: 计算共享密钥 ====
+            logger.info(f"Step 7/13: Calculating shared key for {addr}")
             shared = server_eph.exchange(x25519.X25519PublicKey.from_public_bytes(client_eph_pub))
 
-            info = b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
-            info += b"|" + ke1_data + b"|" + ke2_data + b"|" + kc1_data + b"|" + kc2_data
-
-            okm = hkdf(shared, info, length=64)
-            k_c2s = okm[:32]
-            k_s2c = okm[32:]
-
-            del server_eph
-
-            # ==== 状态12: 生成并发送种子码 ====
-            logger.info(f"Step 12/13: Sending SeedCode to {addr}")
-            if current_state != "KEYCONFIRM2_RECEIVED":
+            # ==== 状态8: 生成并发送种子码 ====
+            logger.info(f"Step 8/13: Sending SeedCode to {addr}")
+            if current_state != "CLIENTCERTSEND_RECEIVED":
                 raise ProtocolError("Invalid state for SeedCode")
             current_state = "SEEDCODE_SENT"
 
             seed_nonce = os.urandom(8)
             seed_code = os.urandom(32) + secrets.token_bytes(32)  # 64字节高熵种子码
+            order_seed = os.urandom(32)  # 顺序随机化种子
+
+            # 定义所有可能的步骤
+            steps = [
+                ("KEYEXCHANGE1", "send", "KeyExchange1"),
+                ("KEYEXCHANGE2", "recv", "KeyExchange2"),
+                ("KEYCONFIRM1", "send", "KeyConfirm1"),
+                ("KEYCONFIRM2", "recv", "KeyConfirm2")
+            ]
+
+            # 使用order_seed生成随机排列
+            rng = random.Random(order_seed)
+            step_order = list(range(len(steps)))
+            rng.shuffle(step_order)
+
+            # 记录步骤顺序
+            step_names = [steps[i][0] for i in step_order]
+            logger.info(f"Generated step order: {step_names} for {addr}")
 
             # 修复：绑定客户端指纹
             digest = hashes.Hash(hashes.SHA256())
             digest.update(client_cert.public_bytes(serialization.Encoding.DER))
             client_fingerprint = digest.finalize()[:16]
 
-            seed_payload = b"SEEDCODE|" + seed_nonce + seed_code + client_fingerprint
+            seed_payload = b"SEEDCODE|" + seed_nonce + seed_code + order_seed + client_fingerprint
+
+            # 使用临时密钥加密种子码
+            info = b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
+            temp_key = hkdf(shared, info, length=64)
+            k_s2c = temp_key[32:]  # 服务端到客户端的临时密钥
+
             temp_aead = ChaCha20Poly1305(k_s2c)
             temp_nonce = transcript[:12]
             encrypted_payload = temp_aead.encrypt(temp_nonce, seed_payload, transcript)
@@ -444,7 +428,85 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
             transcript_hash.update(encrypted_payload)
             transcript = transcript_hash.copy().finalize()
 
-            # ==== 状态13: 接收ClientAuth ====
+            # ==== 状态9-12: 根据随机顺序执行步骤 ====
+            step_data = {}  # 存储各步骤生成的数据
+            step_counter = 9  # 从第9步开始
+
+            for step_idx in step_order:
+                step_type, action, step_name = steps[step_idx]
+                logger.info(
+                    f"Step {9 + step_idx}/13: {'Sending' if action == 'send' else 'Waiting for'} {step_name} to {addr}")
+                step_counter += 1
+                if step_type == "KEYEXCHANGE1":
+                    if action == "send":
+                        ke1_data = os.urandom(32)
+                        step_data["KEYEXCHANGE1"] = ke1_data
+                        ke1 = b"KEYEXCHANGE1|" + ke1_data
+                        conn.sendall(pack(ke1))
+                        transcript_hash.update(ke1)
+                        transcript = transcript_hash.copy().finalize()
+                    else:  # recv
+                        ke1_frame = recv_frame(conn)
+                        ke1_data = parse_protocol_frame(ke1_frame, b"KEYEXCHANGE1")
+                        validate_field(ke1_data, 32, 32, "KeyExchange1 data", is_text=False)
+                        step_data["KEYEXCHANGE1"] = ke1_data
+                        transcript_hash.update(ke1_frame)
+                        transcript = transcript_hash.copy().finalize()
+
+                elif step_type == "KEYEXCHANGE2":
+                    if action == "send":
+                        ke2_data = os.urandom(32)
+                        step_data["KEYEXCHANGE2"] = ke2_data
+                        ke2 = b"KEYEXCHANGE2|" + ke2_data
+                        conn.sendall(pack(ke2))
+                        transcript_hash.update(ke2)
+                        transcript = transcript_hash.copy().finalize()
+                    else:  # recv
+                        ke2_frame = recv_frame(conn)
+                        ke2_data = parse_protocol_frame(ke2_frame, b"KEYEXCHANGE2")
+                        validate_field(ke2_data, 32, 32, "KeyExchange2 data", is_text=False)
+                        step_data["KEYEXCHANGE2"] = ke2_data
+                        transcript_hash.update(ke2_frame)
+                        transcript = transcript_hash.copy().finalize()
+
+                elif step_type == "KEYCONFIRM1":
+                    if action == "send":
+                        kc1_data = os.urandom(32)
+                        step_data["KEYCONFIRM1"] = kc1_data
+                        kc1 = b"KEYCONFIRM1|" + kc1_data
+                        conn.sendall(pack(kc1))
+                        transcript_hash.update(kc1)
+                        transcript = transcript_hash.copy().finalize()
+                    else:  # recv
+                        kc1_frame = recv_frame(conn)
+                        kc1_data = parse_protocol_frame(kc1_frame, b"KEYCONFIRM1")
+                        validate_field(kc1_data, 32, 32, "KeyConfirm1 data", is_text=False)
+                        step_data["KEYCONFIRM1"] = kc1_data
+                        transcript_hash.update(kc1_frame)
+                        transcript = transcript_hash.copy().finalize()
+
+                elif step_type == "KEYCONFIRM2":
+                    if action == "send":
+                        kc2_data = os.urandom(32)
+                        step_data["KEYCONFIRM2"] = kc2_data
+                        kc2 = b"KEYCONFIRM2|" + kc2_data
+                        conn.sendall(pack(kc2))
+                        transcript_hash.update(kc2)
+                        transcript = transcript_hash.copy().finalize()
+                    else:  # recv
+                        kc2_frame = recv_frame(conn)
+                        kc2_data = parse_protocol_frame(kc2_frame, b"KEYCONFIRM2")
+                        validate_field(kc2_data, 32, 32, "KeyConfirm2 data", is_text=False)
+                        step_data["KEYCONFIRM2"] = kc2_data
+                        transcript_hash.update(kc2_frame)
+                        transcript = transcript_hash.copy().finalize()
+
+            # 确保所有步骤数据都已收集
+            required_keys = {"KEYEXCHANGE1", "KEYEXCHANGE2", "KEYCONFIRM1", "KEYCONFIRM2"}
+            if set(step_data.keys()) != required_keys:
+                raise ProtocolError("Missing step data after random order execution")
+
+            # ==== 状态13: 接收ClientAuth并发送ServerAuth ====
             logger.info(f"Step 13/13: Waiting for ClientAuth from {addr}")
             caut_frame = recv_frame(conn)
             if current_state != "SEEDCODE_SENT":
@@ -465,7 +527,7 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
             transcript_hash.update(caut_frame)
             transcript = transcript_hash.copy().finalize()
 
-            # ==== 状态14: 发送ServerAuth ====
+            # 发送ServerAuth
             sig_server = server_priv.sign(transcript)
             sa = b"SERVERAUTH|" + sig_server
             conn.sendall(pack(sa))
@@ -473,8 +535,16 @@ def handle_conn(conn, addr, server_priv, server_cert, ca_cert):
             transcript = transcript_hash.copy().finalize()
             current_state = "SERVERAUTH_SENT"
 
-            # ==== 状态15: 发送SecureAck ====
-            sess = Session(send_key=k_s2c, recv_key=k_c2s, seed_code=seed_code)
+            # ==== 创建会话并发送SecureAck ====
+            # 派生最终会话密钥
+            info = b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
+            info += b"|" + step_data["KEYEXCHANGE1"] + b"|" + step_data["KEYEXCHANGE2"]
+            info += b"|" + step_data["KEYCONFIRM1"] + b"|" + step_data["KEYCONFIRM2"]
+            okm = hkdf(shared, info, length=64)
+            k_c2s = okm[:32]  # 客户端到服务端的密钥
+            k_s2c = okm[32:]  # 服务端到客户端的密钥
+
+            sess = Session(send_key=k_s2c, recv_key=k_c2s, seed_code=seed_code, role="server")
             ct = sess.encrypt(b"ACK", aad=transcript)
             conn.sendall(pack(b"SECUREACK|" + ct))
             current_state = "SECUREACK_SENT"
