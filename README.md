@@ -128,7 +128,35 @@ python client_proxy.py
 
 ### 13次握手示意图
 
-![13次握手](./handshake.png)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+
+    Note over Client, Server: 天启御链加密握手步骤 (13步)
+
+    Client->>Server: 1. CLIENTHELLO (client_eph_pub, nonce_c)
+    Server->>Client: 2. SERVERHELLO (server_eph_pub, nonce_s)
+    Server->>Client: 3. SERVERCERTSEND (server_cert PEM)
+    Server->>Client: 4. CLIENTCERTREQUEST
+    Client->>Server: 5. CLIENTCERTSEND (client_cert PEM)
+    Client->>Server: 6. KEYEXCHANGE1 (extra data 1, 32-byte seed)
+    Note over Client, Server: 基于种子码随机排列以下4步顺序 (24种可能)
+    rect rgba(0, 255, 0, 0.1)
+        Note over Client, Server: 随机顺序区域
+        Server-->>Client: 7. [随机步骤1] (KEYEXCHANGE2 / KEYCONFIRM1 / KEYCONFIRM2 / SEEDCODE)
+        Server-->>Client: 8. [随机步骤2] (剩余3步随机)
+        Server-->>Client: 9. [随机步骤3] (剩余2步随机)
+        Server-->>Client: 10. [随机步骤4] (最后1步)
+    end
+    Client->>Server: 11. CLIENTAUTH (signature over transcript)
+    Server->>Client: 12. SERVERAUTH (signature over transcript)
+    Server->>Client: 13. SECUREACK (encrypted ACK)
+
+    Note over Client, Server: 安全通信通道建立完成
+    Client->>Server: DATA (double-encrypted application data)
+    Server->>Client: DATA (double-encrypted application data)
+```
 
 
 ---
