@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # client.py
 """
-Sovereign-Chain Client - 支持匿名模式
+Sovereign-Chain Client - 优化握手延迟版本
 """
 import random
 import socket, struct, os, time, logging, math, secrets, hashlib, traceback
@@ -15,8 +15,8 @@ from cryptography.exceptions import InvalidSignature
 import threading
 from collections import deque
 import datetime
-import tempfile
 from cryptography.x509.oid import NameOID
+import concurrent.futures
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,23 +24,24 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 FRAME_HDR = 4
-PROTO_VER = b"SC-EE-1"
+PROTO_VER = b"SC-EE-2"  # 协议版本升级
 CIPHER_SUITE = b"X25519-Ed25519-CHACHA20POLY1305-HKDFSHA256"
-HANDSHAKE_TIMEOUT = 30  # 握手超时时间（秒）
+HANDSHAKE_TIMEOUT = 15  # 握手超时时间减少到15秒
 
 # 错误频率限制
 ERROR_TIMES = deque(maxlen=100)
 ERROR_LOCK = threading.Lock()
 
+# 线程池
+COMPUTE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
 
 def safe_log_error(message):
-    """安全日志记录，防止日志泛洪攻击"""
     now = time.time()
     with ERROR_LOCK:
         ERROR_TIMES.append(now)
-        # 检查最近10秒内的错误数量
         recent_errors = [t for t in ERROR_TIMES if now - t < 10]
-        if len(recent_errors) > 50:  # 10秒内超过50个错误则抑制
+        if len(recent_errors) > 50:
             return
         logger.error(message)
 
@@ -51,16 +52,23 @@ def pack(b):
 
 def recv_exact(sock, n):
     buf = b""
+    start_time = time.time()
     while len(buf) < n:
         try:
-            r = sock.recv(n - len(buf))
+            remaining_time = HANDSHAKE_TIMEOUT - (time.time() - start_time)
+            if remaining_time <= 0:
+                raise socket.timeout("receive timeout")
+            sock.settimeout(min(1.0, remaining_time))
+            r = sock.recv(min(4096, n - len(buf)))
             if not r:
                 raise ConnectionError("Connection closed by peer")
             buf += r
         except socket.timeout:
-            raise ConnectionError("Receive timeout")
+            if time.time() - start_time >= HANDSHAKE_TIMEOUT:
+                raise ConnectionError("Receive timeout")
         except ConnectionResetError:
             raise ConnectionError("Connection reset by peer")
+    sock.settimeout(HANDSHAKE_TIMEOUT)
     return buf
 
 
@@ -68,16 +76,29 @@ def recv_frame(sock):
     try:
         hdr = recv_exact(sock, FRAME_HDR)
         (l,) = struct.unpack(">I", hdr)
-        # 修复：降低最大帧大小防止内存耗尽
-        if l > 1_000_000:  # 从50MB改为1MB
+        if l > 1_000_000:
             raise ValueError("Frame too large")
         return recv_exact(sock, l)
     except Exception as e:
         raise ConnectionError(f"Failed to receive frame: {str(e)}")
 
 
+def send_frame(sock, data: bytes):
+    try:
+        sock.sendall(pack(data))
+    except Exception as e:
+        raise ConnectionError(f"Failed to send frame: {str(e)}")
+
+
+def send_combined_message(sock, messages):
+    """合并发送多个消息"""
+    combined = b""
+    for msg in messages:
+        combined += pack(msg)
+    sock.sendall(combined)
+
+
 def load_priv():
-    """尝试加载客户端私钥，如果不存在则返回None"""
     try:
         with open("client_key.pem", "rb") as f:
             return serialization.load_pem_private_key(
@@ -92,7 +113,6 @@ def load_priv():
 
 
 def load_cert():
-    """尝试加载客户端证书，如果不存在则返回None"""
     try:
         with open("client_cert.pem", "rb") as f:
             return x509.load_pem_x509_certificate(
@@ -106,7 +126,6 @@ def load_cert():
 
 
 def load_ca_cert():
-    """使用本地固定路径"""
     try:
         with open("ca_cert.pem", "rb") as f:
             return x509.load_pem_x509_certificate(
@@ -118,10 +137,8 @@ def load_ca_cert():
 
 
 def generate_temp_cert():
-    """生成临时证书和私钥"""
     logger.info("Generating temporary certificate for anonymous connection")
 
-    # 加载匿名CA证书和私钥
     try:
         with open("anonymous_ca_cert.pem", "rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
@@ -130,11 +147,9 @@ def generate_temp_cert():
     except Exception as e:
         raise ValueError(f"Failed to load anonymous CA: {str(e)}")
 
-    # 生成临时密钥对
     priv_key = ed25519.Ed25519PrivateKey.generate()
     pub_key = priv_key.public_key()
 
-    # 创建证书
     subject = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, f"Anonymous-{secrets.token_hex(8)}"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Sovereign Chain"),
@@ -147,23 +162,18 @@ def generate_temp_cert():
     builder = builder.public_key(pub_key)
     builder = builder.serial_number(x509.random_serial_number())
 
-    # 修复：使用正确的UTC时间获取方式
     now = datetime.datetime.now(datetime.timezone.utc)
     builder = builder.not_valid_before(now)
-    builder = builder.not_valid_after(now + datetime.timedelta(minutes=30))  # 短期有效
+    builder = builder.not_valid_after(now + datetime.timedelta(minutes=30))
 
-    # 添加基本约束
     builder = builder.add_extension(
         x509.BasicConstraints(ca=False, path_length=None),
         critical=True
     )
 
-    # 修复：根据私钥类型选择正确的签名算法
     if isinstance(ca_priv, ed25519.Ed25519PrivateKey):
-        # Ed25519不需要指定哈希算法
         cert = builder.sign(ca_priv, algorithm=None)
     else:
-        # 其他算法需要指定哈希算法
         cert = builder.sign(ca_priv, algorithm=hashes.SHA256())
 
     return priv_key, cert
@@ -179,6 +189,17 @@ def hkdf(ikm, info, length=64):
     ).derive(ikm)
 
 
+def compute_shared_key_async(client_eph, server_eph_pub_bytes, cache_key):
+    """异步计算共享密钥"""
+    try:
+        server_eph_pub = x25519.X25519PublicKey.from_public_bytes(server_eph_pub_bytes)
+        shared = client_eph.exchange(server_eph_pub)
+        return shared
+    except Exception as e:
+        logger.error(f"Failed to compute shared key: {str(e)}")
+        return None
+
+
 def nonce_from_seq(seq: int, label: bytes):
     h = hashes.Hash(hashes.SHA256(), backend=default_backend())
     h.update(label)
@@ -187,21 +208,17 @@ def nonce_from_seq(seq: int, label: bytes):
 
 
 def validate_field(data, min_len, max_len, field_name, is_text=False):
-    """修复：验证字段长度和内容"""
     if not isinstance(data, bytes):
         raise ValueError(f"{field_name} must be bytes")
     if len(data) < min_len or len(data) > max_len:
         raise ValueError(f"Invalid {field_name} length: {len(data)}")
 
-    # 仅对文本字段检查可打印字符
     if is_text:
         if any(b < 0x20 or b > 0x7E for b in data):
             raise ValueError(f"Invalid characters in {field_name}")
 
 
 def parse_protocol_frame(frame, expected_type):
-    """修复：安全解析协议帧"""
-    # 直接使用前缀长度提取payload
     expected_prefix = expected_type + b"|"
     if not frame.startswith(expected_prefix):
         raise ProtocolError(f"Invalid frame format for {expected_type.decode()}")
@@ -209,40 +226,29 @@ def parse_protocol_frame(frame, expected_type):
 
 
 class ProtocolError(Exception):
-    """协议错误异常"""
     pass
 
 
 class Session:
     def __init__(self, send_key, recv_key, seed_code, role="client"):
-        """
-        初始化会话
-        :param send_key: 发送密钥
-        :param recv_key: 接收密钥
-        :param seed_code: 种子码
-        :param role: 角色 ("client" 或 "server")
-        """
         self.send_base_key = send_key
         self.recv_base_key = recv_key
         self.seed_code = seed_code
         self.send_seq = 1
         self.recv_seq = 1
 
-        # 根据角色设置标签
         if role == "client":
             self.send_label = b"client->server"
             self.recv_label = b"server->client"
-        else:  # server
+        else:
             self.send_label = b"server->client"
             self.recv_label = b"client->server"
 
     def _derive_key(self, base_key, seq, label):
-        """使用种子码和序列号派生动态密钥"""
         info = self.seed_code + struct.pack(">Q", seq) + label
         return hkdf(base_key, info, length=32)
 
     def encrypt(self, pt: bytes, aad: bytes = b""):
-        """加密数据"""
         dynamic_key = self._derive_key(self.send_base_key, self.send_seq, self.send_label)
         aead = ChaCha20Poly1305(dynamic_key)
         n = nonce_from_seq(self.send_seq, self.send_label)
@@ -251,7 +257,6 @@ class Session:
         return ct
 
     def decrypt(self, ct: bytes, aad: bytes = b""):
-        """解密数据"""
         dynamic_key = self._derive_key(self.recv_base_key, self.recv_seq, self.recv_label)
         aead = ChaCha20Poly1305(dynamic_key)
         n = nonce_from_seq(self.recv_seq, self.recv_label)
@@ -260,29 +265,43 @@ class Session:
         return pt
 
 
+def verify_server_certificate_async(server_cert_pem_bytes, ca_cert, transcript_hash):
+    """异步验证服务器证书"""
+    try:
+        server_cert = x509.load_pem_x509_certificate(
+            server_cert_pem_bytes,
+            backend=default_backend()
+        )
+
+        ca_pub = ca_cert.public_key()
+        if not isinstance(ca_pub, ed25519.Ed25519PublicKey):
+            raise ValueError("CA public key is not Ed25519")
+
+        ca_pub.verify(
+            server_cert.signature,
+            server_cert.tbs_certificate_bytes
+        )
+        return server_cert, True
+    except Exception as e:
+        return None, str(e)
+
+
 def client_handshake(host="127.0.0.1", port=5555):
-    """执行13步握手，返回已握手完成的 Session 和 socket"""
-    logger.info(f"Starting handshake with {host}:{port}")
+    logger.info(f"Starting optimized handshake with {host}:{port}")
 
-    # 状态机初始化
-    current_state = "INIT"
-
-    # 幂等性缓存
-    if not hasattr(client_handshake, "nonce_cache"):
-        client_handshake.nonce_cache = set()
-
+    # 加载证书
     try:
         client_priv = load_priv()
         client_cert = load_cert()
         ca_cert = load_ca_cert()
 
-        # 如果没有固定证书，生成临时证书
         if client_priv is None or client_cert is None:
             logger.info("No fixed certificate found, generating temporary certificate")
             client_priv, client_cert = generate_temp_cert()
     except Exception as e:
         raise ConnectionError(f"Failed to load credentials: {str(e)}")
 
+    # 连接服务器
     try:
         s = socket.create_connection((host, port))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -292,13 +311,11 @@ def client_handshake(host="127.0.0.1", port=5555):
 
     handshake_start_time = time.time()
     transcript_hash = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    futures = []
 
     try:
-        # ==== 状态1: 发送ClientHello ====
-        logger.info("Step 1/13: Sending ClientHello")
-        if current_state != "INIT":
-            raise ProtocolError("Invalid state for ClientHello")
-        current_state = "CLIENTHELLO_SENT"
+        # ==== 步骤1: 发送ClientHello ====
+        logger.info("Step 1/7: Sending ClientHello")
 
         client_eph = x25519.X25519PrivateKey.generate()
         client_eph_pub = client_eph.public_key().public_bytes(
@@ -306,240 +323,160 @@ def client_handshake(host="127.0.0.1", port=5555):
             serialization.PublicFormat.Raw
         )
         nonce_c = os.urandom(16)
+
         ch = b"CLIENTHELLO|" + client_eph_pub + nonce_c
-        s.sendall(pack(ch))
+        send_frame(s, ch)
         transcript_hash.update(ch)
         transcript = transcript_hash.copy().finalize()
 
-        # ==== 状态2: 接收ServerHello ====
-        logger.info("Step 2/13: Waiting for ServerHello")
-        sh_frame = recv_frame(s)
-        if current_state != "CLIENTHELLO_SENT":
-            raise ProtocolError("Invalid state for ServerHello")
-        current_state = "SERVERHELLO_RECEIVED"
+        # ==== 步骤2: 接收合并的消息 (ServerHello, ServerCertSend, ClientCertRequest) ====
+        logger.info("Step 2/7: Receiving combined server messages")
 
-        # 修复：直接解析整个帧
+        # 接收三个合并的消息
+        sh_frame = recv_frame(s)
+        scert_frame = recv_frame(s)
+        ccr_frame = recv_frame(s)
+
+        # 解析ServerHello
         if not sh_frame.startswith(b"SERVERHELLO|"):
             raise ValueError("Invalid ServerHello message format")
 
-        payload = sh_frame[len(b"SERVERHELLO|"):]
-        if len(payload) != 48:  # 32字节公钥 + 16字节nonce
-            raise ValueError(f"Invalid ServerHello payload length: {len(payload)}")
+        sh_payload = sh_frame[len(b"SERVERHELLO|"):]
+        if len(sh_payload) != 48:
+            raise ValueError(f"Invalid ServerHello payload length: {len(sh_payload)}")
 
-        server_eph_pub = payload[:32]
-        nonce_s = payload[32:48]
+        server_eph_pub = sh_payload[:32]
+        nonce_s = sh_payload[32:48]
 
         transcript_hash.update(sh_frame)
         transcript = transcript_hash.copy().finalize()
 
-        # ==== 状态3: 接收ServerCertSend ====
-        logger.info("Step 3/13: Waiting for ServerCertSend")
-        scert_frame = recv_frame(s)
-        if current_state != "SERVERHELLO_RECEIVED":
-            raise ProtocolError("Invalid state for ServerCertSend")
-        current_state = "SERVERCERTSEND_RECEIVED"
-
-        server_cert_pem = parse_protocol_frame(scert_frame, b"SERVERCERTSEND")
-        server_cert = x509.load_pem_x509_certificate(
-            server_cert_pem,
-            backend=default_backend()
+        # 异步启动共享密钥计算
+        cache_key = (host, port, nonce_c.tobytes() if hasattr(nonce_c, 'tobytes') else nonce_c)
+        shared_key_future = COMPUTE_POOL.submit(
+            compute_shared_key_async,
+            client_eph,
+            server_eph_pub,
+            cache_key
         )
+        futures.append(("shared_key", shared_key_future))
+
+        # 解析ServerCertSend
+        server_cert_pem = parse_protocol_frame(scert_frame, b"SERVERCERTSEND")
+
+        # 异步验证服务器证书
+        cert_future = COMPUTE_POOL.submit(
+            verify_server_certificate_async,
+            server_cert_pem,
+            ca_cert,
+            transcript_hash.copy()
+        )
+        futures.append(("cert_verify", cert_future))
+
         transcript_hash.update(scert_frame)
         transcript = transcript_hash.copy().finalize()
 
-        # ==== 状态4: 验证服务器证书 ====
-        logger.info("Step 4/13: Verifying server certificate")
-        ca_pub = ca_cert.public_key()
-        try:
-            if not isinstance(ca_pub, ed25519.Ed25519PublicKey):
-                raise ValueError("CA public key is not Ed25519")
-            ca_pub.verify(
-                server_cert.signature,
-                server_cert.tbs_certificate_bytes
-            )
-            logger.info("Server certificate verified successfully")
-        except InvalidSignature:
-            raise ValueError("Server certificate signature is invalid")
-        except Exception as e:
-            raise ValueError(f"Server certificate verification failed: {str(e)}")
-
-        # ==== 状态5: 接收ClientCertRequest ====
-        logger.info("Step 5/13: Waiting for ClientCertRequest")
-        ccr_frame = recv_frame(s)
-        if current_state != "SERVERCERTSEND_RECEIVED":
-            raise ProtocolError("Invalid state for ClientCertRequest")
-        current_state = "CLIENTCERTREQUEST_RECEIVED"
-
+        # 解析ClientCertRequest
         parse_protocol_frame(ccr_frame, b"CLIENTCERTREQUEST")
         transcript_hash.update(ccr_frame)
         transcript = transcript_hash.copy().finalize()
 
-        # ==== 状态6: 发送ClientCertSend ====
-        logger.info("Step 6/13: Sending ClientCertSend")
+        # ==== 步骤3: 发送ClientCertSend ====
+        logger.info("Step 3/7: Sending ClientCertSend")
+
         ccert_fr = b"CLIENTCERTSEND|" + client_cert.public_bytes(serialization.Encoding.PEM)
-        s.sendall(pack(ccert_fr))
+        send_frame(s, ccert_fr)
         transcript_hash.update(ccert_fr)
         transcript = transcript_hash.copy().finalize()
-        current_state = "CLIENTCERTSEND_SENT"
 
-        # ==== 状态7: 计算共享密钥 ====
-        logger.info("Step 7/13: Calculating shared key")
-        shared = client_eph.exchange(x25519.X25519PublicKey.from_public_bytes(server_eph_pub))
+        # ==== 步骤4: 接收种子码和预计算的密钥材料 ====
+        logger.info("Step 4/7: Receiving seed code and precomputed key materials")
 
-        # ==== 状态8: 接收并解密SeedCode ====
-        logger.info("Step 8/13: Receiving and decrypting SeedCode")
-        encrypted_payload = recv_frame(s)
-        if current_state != "CLIENTCERTSEND_SENT":
-            raise ProtocolError("Invalid state for SeedCode")
-        current_state = "SEEDCODE_RECEIVED"
+        # 接收多个合并的消息
+        seed_frame = recv_frame(s)
+        ke1_frame = recv_frame(s)
+        ke2_frame = recv_frame(s)
+        kc1_frame = recv_frame(s)
+        kc2_frame = recv_frame(s)
 
-        # 使用临时密钥解密种子码
+        # 等待共享密钥计算完成
+        shared = shared_key_future.result(timeout=5)
+        if shared is None:
+            raise ProtocolError("Failed to compute shared key")
+
+        # 等待证书验证完成
+        server_cert, cert_result = cert_future.result(timeout=5)
+        if server_cert is None:
+            raise ProtocolError(f"Server certificate verification failed: {cert_result}")
+
+        logger.info("Server certificate verified successfully")
+
+        # 解密种子码
         info = b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
         temp_key = hkdf(shared, info, length=64)
-        k_s2c = temp_key[32:]  # 服务端到客户端的临时密钥
+        k_s2c = temp_key[32:]
 
         temp_aead = ChaCha20Poly1305(k_s2c)
         temp_nonce = transcript[:12]
 
         try:
-            payload = temp_aead.decrypt(temp_nonce, encrypted_payload, transcript)
-            if not payload.startswith(b"SEEDCODE|"):
+            seed_payload = temp_aead.decrypt(temp_nonce, seed_frame, transcript)
+            if not seed_payload.startswith(b"SEEDCODE|"):
                 raise ValueError("Invalid seed code format")
 
-            seed_payload = payload.split(b"|", 1)[1]
-            if len(seed_payload) < 104:  # 8+64+32+16=120 - 前缀长度
-                raise ValueError("Invalid seed payload length")
-
-            seed_nonce = seed_payload[:8]
-            seed_code = seed_payload[8:72]
-            order_seed = seed_payload[72:104]  # 顺序随机化种子
-            client_fingerprint = seed_payload[104:120]  # 客户端指纹
+            seed_data = seed_payload.split(b"|", 1)[1]
+            if len(seed_data) < 8:
+                raise ValueError("Invalid seed data length")
 
             # 幂等性检查
+            seed_nonce = seed_data[:8]
+            if not hasattr(client_handshake, "nonce_cache"):
+                client_handshake.nonce_cache = set()
+
             if seed_nonce in client_handshake.nonce_cache:
                 raise ValueError("Seed frame replay detected")
             client_handshake.nonce_cache.add(seed_nonce)
-
-            # 定义所有可能的步骤
-            steps = [
-                ("KEYEXCHANGE1", "recv", "KeyExchange1"),
-                ("KEYEXCHANGE2", "send", "KeyExchange2"),
-                ("KEYCONFIRM1", "recv", "KeyConfirm1"),
-                ("KEYCONFIRM2", "send", "KeyConfirm2")
-            ]
-
-            # 使用相同的随机种子生成相同的随机顺序
-            rng = random.Random(order_seed)
-            step_order = list(range(len(steps)))
-            rng.shuffle(step_order)
-
-            # 记录步骤顺序
-            step_names = [steps[i][0] for i in step_order]
-            logger.info(f"Generated step order: {step_names}")
 
         except Exception as e:
             logger.error(f"Seed frame processing failed: {str(e)}")
             s.close()
             raise
 
-        transcript_hash.update(encrypted_payload)
+        # 解析预计算的密钥材料
+        ke1_data = parse_protocol_frame(ke1_frame, b"KEYEXCHANGE1")
+        ke2_data = parse_protocol_frame(ke2_frame, b"KEYEXCHANGE2")
+        kc1_data = parse_protocol_frame(kc1_frame, b"KEYCONFIRM1")
+        kc2_data = parse_protocol_frame(kc2_frame, b"KEYCONFIRM2")
+
+        validate_field(ke1_data, 32, 32, "KeyExchange1 data")
+        validate_field(ke2_data, 32, 32, "KeyExchange2 data")
+        validate_field(kc1_data, 32, 32, "KeyConfirm1 data")
+        validate_field(kc2_data, 32, 32, "KeyConfirm2 data")
+
+        # 更新transcript
+        transcript_hash.update(seed_frame)
+        transcript_hash.update(ke1_frame)
+        transcript_hash.update(ke2_frame)
+        transcript_hash.update(kc1_frame)
+        transcript_hash.update(kc2_frame)
         transcript = transcript_hash.copy().finalize()
 
-        # ==== 状态9-12: 根据随机顺序执行步骤 ====
-        step_data = {}  # 存储各步骤生成的数据
-        step_counter = 9  # 从第9步开始
+        # ==== 步骤5: 发送ClientAuth ====
+        logger.info("Step 5/7: Sending ClientAuth")
 
-        for step_idx in step_order:
-            step_type, action, step_name = steps[step_idx]
-            logger.info(f"Step {9 + step_idx}/13: {'Sending' if action == 'send' else 'Waiting for'} {step_name}")
-            step_counter += 1
-
-            if step_type == "KEYEXCHANGE1":
-                if action == "send":
-                    ke1_data = os.urandom(32)
-                    step_data["KEYEXCHANGE1"] = ke1_data
-                    ke1 = b"KEYEXCHANGE1|" + ke1_data
-                    s.sendall(pack(ke1))
-                    transcript_hash.update(ke1)
-                    transcript = transcript_hash.copy().finalize()
-                else:  # recv
-                    ke1_frame = recv_frame(s)
-                    ke1_data = parse_protocol_frame(ke1_frame, b"KEYEXCHANGE1")
-                    validate_field(ke1_data, 32, 32, "KeyExchange1 data", is_text=False)
-                    step_data["KEYEXCHANGE1"] = ke1_data
-                    transcript_hash.update(ke1_frame)
-                    transcript = transcript_hash.copy().finalize()
-
-            elif step_type == "KEYEXCHANGE2":
-                if action == "send":
-                    ke2_data = os.urandom(32)
-                    step_data["KEYEXCHANGE2"] = ke2_data
-                    ke2 = b"KEYEXCHANGE2|" + ke2_data
-                    s.sendall(pack(ke2))
-                    transcript_hash.update(ke2)
-                    transcript = transcript_hash.copy().finalize()
-                else:  # recv
-                    ke2_frame = recv_frame(s)
-                    ke2_data = parse_protocol_frame(ke2_frame, b"KEYEXCHANGE2")
-                    validate_field(ke2_data, 32, 32, "KeyExchange2 data", is_text=False)
-                    step_data["KEYEXCHANGE2"] = ke2_data
-                    transcript_hash.update(ke2_frame)
-                    transcript = transcript_hash.copy().finalize()
-
-            elif step_type == "KEYCONFIRM1":
-                if action == "send":
-                    kc1_data = os.urandom(32)
-                    step_data["KEYCONFIRM1"] = kc1_data
-                    kc1 = b"KEYCONFIRM1|" + kc1_data
-                    s.sendall(pack(kc1))
-                    transcript_hash.update(kc1)
-                    transcript = transcript_hash.copy().finalize()
-                else:  # recv
-                    kc1_frame = recv_frame(s)
-                    kc1_data = parse_protocol_frame(kc1_frame, b"KEYCONFIRM1")
-                    validate_field(kc1_data, 32, 32, "KeyConfirm1 data", is_text=False)
-                    step_data["KEYCONFIRM1"] = kc1_data
-                    transcript_hash.update(kc1_frame)
-                    transcript = transcript_hash.copy().finalize()
-
-            elif step_type == "KEYCONFIRM2":
-                if action == "send":
-                    kc2_data = os.urandom(32)
-                    step_data["KEYCONFIRM2"] = kc2_data
-                    kc2 = b"KEYCONFIRM2|" + kc2_data
-                    s.sendall(pack(kc2))
-                    transcript_hash.update(kc2)
-                    transcript = transcript_hash.copy().finalize()
-                else:  # recv
-                    kc2_frame = recv_frame(s)
-                    kc2_data = parse_protocol_frame(kc2_frame, b"KEYCONFIRM2")
-                    validate_field(kc2_data, 32, 32, "KeyConfirm2 data", is_text=False)
-                    step_data["KEYCONFIRM2"] = kc2_data
-                    transcript_hash.update(kc2_frame)
-                    transcript = transcript_hash.copy().finalize()
-
-        # 确保所有步骤数据都已收集
-        required_keys = {"KEYEXCHANGE1", "KEYEXCHANGE2", "KEYCONFIRM1", "KEYCONFIRM2"}
-        if set(step_data.keys()) != required_keys:
-            raise ProtocolError("Missing step data after random order execution")
-
-        # ==== 状态13: 发送ClientAuth并接收ServerAuth ====
-        logger.info("Step 13/13: Sending ClientAuth and completing handshake")
         sig_client = client_priv.sign(transcript)
         auth_msg = b"CLIENTAUTH|" + sig_client
-        s.sendall(pack(auth_msg))
+        send_frame(s, auth_msg)
         transcript_hash.update(auth_msg)
         transcript = transcript_hash.copy().finalize()
-        current_state = "CLIENTAUTH_SENT"
 
-        # 接收ServerAuth
+        # ==== 步骤6: 接收ServerAuth ====
+        logger.info("Step 6/7: Receiving ServerAuth")
+
         sa_frame = recv_frame(s)
-        if current_state != "CLIENTAUTH_SENT":
-            raise ProtocolError("Invalid state for ServerAuth")
-        current_state = "SERVERAUTH_RECEIVED"
-
         sig_server = parse_protocol_frame(sa_frame, b"SERVERAUTH")
         server_pub = server_cert.public_key()
+
         if not isinstance(server_pub, ed25519.Ed25519PublicKey):
             raise ValueError("Server public key is not Ed25519")
 
@@ -548,24 +485,25 @@ def client_handshake(host="127.0.0.1", port=5555):
             logger.info("Server signature verified successfully")
         except InvalidSignature:
             raise ValueError("Server signature verification failed")
+
         transcript_hash.update(sa_frame)
         transcript = transcript_hash.copy().finalize()
 
-        # 接收SecureAck
+        # ==== 步骤7: 接收SecureAck并建立会话 ====
+        logger.info("Step 7/7: Establishing secure session")
+
         ack_frame = recv_frame(s)
-        if current_state != "SERVERAUTH_RECEIVED":
-            raise ProtocolError("Invalid state for SecureAck")
-        current_state = "SECUREACK_RECEIVED"
 
         # 派生最终会话密钥
         info = b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
-        info += b"|" + step_data["KEYEXCHANGE1"] + b"|" + step_data["KEYEXCHANGE2"]
-        info += b"|" + step_data["KEYCONFIRM1"] + b"|" + step_data["KEYCONFIRM2"]
+        info += b"|" + ke1_data + b"|" + ke2_data
+        info += b"|" + kc1_data + b"|" + kc2_data
         okm = hkdf(shared, info, length=64)
-        k_c2s = okm[:32]  # 客户端到服务端的密钥
-        k_s2c = okm[32:]  # 服务端到客户端的密钥
+        k_c2s = okm[:32]
+        k_s2c = okm[32:]
 
-        sess = Session(send_key=k_c2s, recv_key=k_s2c, seed_code=seed_code, role="client")
+        sess = Session(send_key=k_c2s, recv_key=k_s2c,
+                       seed_code=seed_data[8:72] if len(seed_data) >= 72 else seed_data[8:], role="client")
 
         ct = parse_protocol_frame(ack_frame, b"SECUREACK")
         try:
@@ -575,6 +513,7 @@ def client_handshake(host="127.0.0.1", port=5555):
             logger.info("Secure ACK verified successfully")
         except Exception as e:
             raise ValueError(f"Secure ACK verification failed: {str(e)}")
+
         transcript_hash.update(ack_frame)
         transcript = transcript_hash.copy().finalize()
 
@@ -591,6 +530,11 @@ def client_handshake(host="127.0.0.1", port=5555):
         s.close()
         safe_log_error(f"Handshake failed: {str(e)}")
         raise ConnectionError(f"Handshake failed: {str(e)}")
+    finally:
+        # 清理未完成的异步任务
+        for name, future in futures:
+            if not future.done():
+                future.cancel()
 
 
 def main():
@@ -607,7 +551,7 @@ def main():
                 header = struct.pack(">Q", current_seq)
                 ct = sess.encrypt(line.encode())
                 data_frame = b"DATA" + header + ct
-                s.sendall(pack(data_frame))
+                send_frame(s, data_frame)
 
                 try:
                     frm = recv_frame(s)
