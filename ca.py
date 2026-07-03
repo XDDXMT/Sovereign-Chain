@@ -14,12 +14,13 @@
 """
 import datetime
 from cryptography import x509
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
 from cryptography.hazmat.primitives.asymmetric import padding
 import hashlib
+import ipaddress
 import os
 import shutil
 
@@ -42,7 +43,8 @@ def gen_rsa_key():
 
 
 def build_cert(subject_name: str, issuer_name: str, subject_pub, issuer_priv,
-               is_ca=False, path_length=None, days_valid=3650):
+               is_ca=False, path_length=None, days_valid=3650,
+               san_names=None, extended_key_usages=None):
     now = datetime.datetime.now(datetime.timezone.utc)
 
     subject = x509.Name([
@@ -84,6 +86,21 @@ def build_cert(subject_name: str, issuer_name: str, subject_pub, issuer_priv,
         decipher_only=False
     )
     builder = builder.add_extension(key_usage, critical=True)
+
+    if san_names:
+        names = []
+        for name in san_names:
+            try:
+                names.append(x509.IPAddress(ipaddress.ip_address(name)))
+            except ValueError:
+                names.append(x509.DNSName(name))
+        builder = builder.add_extension(x509.SubjectAlternativeName(names), critical=False)
+
+    if extended_key_usages:
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage(extended_key_usages),
+            critical=False
+        )
 
     # 添加主题密钥标识符
     builder = builder.add_extension(
@@ -171,7 +188,9 @@ def main():
         server_pub,
         intermediate_ca_priv,
         is_ca=False,
-        days_valid=365
+        days_valid=365,
+        san_names=["Sovereign-Chain-Server", "localhost", "127.0.0.1", "::1"],
+        extended_key_usages=[ExtendedKeyUsageOID.SERVER_AUTH]
     )
     save_pem("server_key.pem", server_priv.private_bytes(
         Encoding.PEM,
@@ -190,7 +209,9 @@ def main():
         client_pub,
         intermediate_ca_priv,
         is_ca=False,
-        days_valid=365
+        days_valid=365,
+        san_names=["Sovereign-Chain-Client"],
+        extended_key_usages=[ExtendedKeyUsageOID.CLIENT_AUTH]
     )
     save_pem("client_key.pem", client_priv.private_bytes(
         Encoding.PEM,

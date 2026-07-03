@@ -7,7 +7,6 @@ import random
 import socket, struct, os, time, logging, math, secrets, hashlib, traceback
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -15,8 +14,16 @@ from cryptography.exceptions import InvalidSignature
 import threading
 from collections import deque
 import datetime
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import concurrent.futures
+from security import (
+    CIPHER_SUITE,
+    PROTO_VER,
+    Session,
+    hkdf,
+    validate_peer_certificate,
+    verify_private_key_matches_certificate,
+)
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,9 +31,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 FRAME_HDR = 4
-PROTO_VER = b"SC-EE-2"  # 协议版本升级
-CIPHER_SUITE = b"X25519-Ed25519-CHACHA20POLY1305-HKDFSHA256"
 HANDSHAKE_TIMEOUT = 15  # 握手超时时间减少到15秒
+CLIENT_HELLO_PREFIX = b"CLIENTHELLO|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|"
+SERVER_HELLO_PREFIX = b"SERVERHELLO|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|"
 
 # 错误频率限制
 ERROR_TIMES = deque(maxlen=100)
@@ -100,10 +107,11 @@ def send_combined_message(sock, messages):
 
 def load_priv():
     try:
-        with open("client_key.pem", "rb") as f:
+        password = os.getenv("SC_CLIENT_KEY_PASSWORD")
+        with open(os.getenv("SC_CLIENT_KEY_FILE", "client_key.pem"), "rb") as f:
             return serialization.load_pem_private_key(
                 f.read(),
-                password=None,
+                password=password.encode() if password else None,
                 backend=default_backend()
             )
     except FileNotFoundError:
@@ -114,7 +122,7 @@ def load_priv():
 
 def load_cert():
     try:
-        with open("client_cert.pem", "rb") as f:
+        with open(os.getenv("SC_CLIENT_CERT_FILE", "client_cert.pem"), "rb") as f:
             return x509.load_pem_x509_certificate(
                 f.read(),
                 backend=default_backend()
@@ -127,7 +135,7 @@ def load_cert():
 
 def load_ca_cert():
     try:
-        with open("ca_cert.pem", "rb") as f:
+        with open(os.getenv("SC_CA_CERT_FILE", "ca_cert.pem"), "rb") as f:
             return x509.load_pem_x509_certificate(
                 f.read(),
                 backend=default_backend()
@@ -140,10 +148,15 @@ def generate_temp_cert():
     logger.info("Generating temporary certificate for anonymous connection")
 
     try:
-        with open("anonymous_ca_cert.pem", "rb") as f:
+        with open(os.getenv("SC_ANONYMOUS_CA_CERT_FILE", "anonymous_ca_cert.pem"), "rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
-        with open("anonymous_ca_key.pem", "rb") as f:
-            ca_priv = serialization.load_pem_private_key(f.read(), None, default_backend())
+        password = os.getenv("SC_ANONYMOUS_CA_KEY_PASSWORD")
+        with open(os.getenv("SC_ANONYMOUS_CA_KEY_FILE", "anonymous_ca_key.pem"), "rb") as f:
+            ca_priv = serialization.load_pem_private_key(
+                f.read(),
+                password.encode() if password else None,
+                default_backend(),
+            )
     except Exception as e:
         raise ValueError(f"Failed to load anonymous CA: {str(e)}")
 
@@ -170,6 +183,24 @@ def generate_temp_cert():
         x509.BasicConstraints(ca=False, path_length=None),
         critical=True
     )
+    builder = builder.add_extension(
+        x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        ),
+        critical=True,
+    )
+    builder = builder.add_extension(
+        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]),
+        critical=False,
+    )
 
     if isinstance(ca_priv, ed25519.Ed25519PrivateKey):
         cert = builder.sign(ca_priv, algorithm=None)
@@ -179,17 +210,7 @@ def generate_temp_cert():
     return priv_key, cert
 
 
-def hkdf(ikm, info, length=64):
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=length,
-        salt=None,
-        info=info,
-        backend=default_backend()
-    ).derive(ikm)
-
-
-def compute_shared_key_async(client_eph, server_eph_pub_bytes, cache_key):
+def compute_shared_key_async(client_eph, server_eph_pub_bytes):
     """异步计算共享密钥"""
     try:
         server_eph_pub = x25519.X25519PublicKey.from_public_bytes(server_eph_pub_bytes)
@@ -198,13 +219,6 @@ def compute_shared_key_async(client_eph, server_eph_pub_bytes, cache_key):
     except Exception as e:
         logger.error(f"Failed to compute shared key: {str(e)}")
         return None
-
-
-def nonce_from_seq(seq: int, label: bytes):
-    h = hashes.Hash(hashes.SHA256(), backend=default_backend())
-    h.update(label)
-    prefix = h.finalize()[:4]
-    return prefix + struct.pack(">Q", seq)
 
 
 def validate_field(data, min_len, max_len, field_name, is_text=False):
@@ -229,43 +243,7 @@ class ProtocolError(Exception):
     pass
 
 
-class Session:
-    def __init__(self, send_key, recv_key, seed_code, role="client"):
-        self.send_base_key = send_key
-        self.recv_base_key = recv_key
-        self.seed_code = seed_code
-        self.send_seq = 1
-        self.recv_seq = 1
-
-        if role == "client":
-            self.send_label = b"client->server"
-            self.recv_label = b"server->client"
-        else:
-            self.send_label = b"server->client"
-            self.recv_label = b"client->server"
-
-    def _derive_key(self, base_key, seq, label):
-        info = self.seed_code + struct.pack(">Q", seq) + label
-        return hkdf(base_key, info, length=32)
-
-    def encrypt(self, pt: bytes, aad: bytes = b""):
-        dynamic_key = self._derive_key(self.send_base_key, self.send_seq, self.send_label)
-        aead = ChaCha20Poly1305(dynamic_key)
-        n = nonce_from_seq(self.send_seq, self.send_label)
-        ct = aead.encrypt(n, pt, aad)
-        self.send_seq += 1
-        return ct
-
-    def decrypt(self, ct: bytes, aad: bytes = b""):
-        dynamic_key = self._derive_key(self.recv_base_key, self.recv_seq, self.recv_label)
-        aead = ChaCha20Poly1305(dynamic_key)
-        n = nonce_from_seq(self.recv_seq, self.recv_label)
-        pt = aead.decrypt(n, ct, aad)
-        self.recv_seq += 1
-        return pt
-
-
-def verify_server_certificate_async(server_cert_pem_bytes, ca_cert, transcript_hash):
+def verify_server_certificate_async(server_cert_pem_bytes, ca_cert, expected_identity):
     """异步验证服务器证书"""
     try:
         server_cert = x509.load_pem_x509_certificate(
@@ -273,21 +251,22 @@ def verify_server_certificate_async(server_cert_pem_bytes, ca_cert, transcript_h
             backend=default_backend()
         )
 
-        ca_pub = ca_cert.public_key()
-        if not isinstance(ca_pub, ed25519.Ed25519PublicKey):
-            raise ValueError("CA public key is not Ed25519")
-
-        ca_pub.verify(
-            server_cert.signature,
-            server_cert.tbs_certificate_bytes
+        validate_peer_certificate(
+            server_cert,
+            ca_cert,
+            role="server",
+            expected_identity=expected_identity,
         )
         return server_cert, True
     except Exception as e:
         return None, str(e)
 
 
-def client_handshake(host="127.0.0.1", port=5555):
+def client_handshake(host="127.0.0.1", port=5555, expected_server_name=None):
     logger.info(f"Starting optimized handshake with {host}:{port}")
+    expected_server_name = expected_server_name or os.getenv(
+        "SC_SERVER_NAME", "Sovereign-Chain-Server"
+    )
 
     # 加载证书
     try:
@@ -296,8 +275,11 @@ def client_handshake(host="127.0.0.1", port=5555):
         ca_cert = load_ca_cert()
 
         if client_priv is None or client_cert is None:
-            logger.info("No fixed certificate found, generating temporary certificate")
+            if os.getenv("SC_ALLOW_ANONYMOUS_CLIENTS") != "1":
+                raise ValueError("client certificate is required; anonymous mode is disabled")
+            logger.warning("Anonymous client mode is enabled")
             client_priv, client_cert = generate_temp_cert()
+        verify_private_key_matches_certificate(client_priv, client_cert)
     except Exception as e:
         raise ConnectionError(f"Failed to load credentials: {str(e)}")
 
@@ -324,7 +306,7 @@ def client_handshake(host="127.0.0.1", port=5555):
         )
         nonce_c = os.urandom(16)
 
-        ch = b"CLIENTHELLO|" + client_eph_pub + nonce_c
+        ch = CLIENT_HELLO_PREFIX + client_eph_pub + nonce_c
         send_frame(s, ch)
         transcript_hash.update(ch)
         transcript = transcript_hash.copy().finalize()
@@ -338,10 +320,10 @@ def client_handshake(host="127.0.0.1", port=5555):
         ccr_frame = recv_frame(s)
 
         # 解析ServerHello
-        if not sh_frame.startswith(b"SERVERHELLO|"):
+        if not sh_frame.startswith(SERVER_HELLO_PREFIX):
             raise ValueError("Invalid ServerHello message format")
 
-        sh_payload = sh_frame[len(b"SERVERHELLO|"):]
+        sh_payload = sh_frame[len(SERVER_HELLO_PREFIX):]
         if len(sh_payload) != 48:
             raise ValueError(f"Invalid ServerHello payload length: {len(sh_payload)}")
 
@@ -352,12 +334,10 @@ def client_handshake(host="127.0.0.1", port=5555):
         transcript = transcript_hash.copy().finalize()
 
         # 异步启动共享密钥计算
-        cache_key = (host, port, nonce_c.tobytes() if hasattr(nonce_c, 'tobytes') else nonce_c)
         shared_key_future = COMPUTE_POOL.submit(
             compute_shared_key_async,
             client_eph,
             server_eph_pub,
-            cache_key
         )
         futures.append(("shared_key", shared_key_future))
 
@@ -369,7 +349,7 @@ def client_handshake(host="127.0.0.1", port=5555):
             verify_server_certificate_async,
             server_cert_pem,
             ca_cert,
-            transcript_hash.copy()
+            expected_server_name,
         )
         futures.append(("cert_verify", cert_future))
 
@@ -547,9 +527,8 @@ def main():
                 if not line:
                     continue
 
-                current_seq = sess.send_seq
+                current_seq, ct = sess.encrypt_with_sequence(line.encode())
                 header = struct.pack(">Q", current_seq)
-                ct = sess.encrypt(line.encode())
                 data_frame = b"DATA" + header + ct
                 send_frame(s, data_frame)
 
@@ -575,7 +554,7 @@ def main():
                     break
 
                 try:
-                    resp = sess.decrypt(resp_ct)
+                    resp = sess.decrypt_with_sequence(resp_seq, resp_ct)
                     print("server:", resp.decode(errors="ignore"))
                 except Exception as e:
                     safe_log_error(f"Decryption error: {str(e)}")

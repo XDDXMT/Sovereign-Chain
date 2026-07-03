@@ -8,6 +8,7 @@ import threading
 import logging
 import struct
 import time
+import os
 from collections import deque
 from client import client_handshake, Session, recv_frame, pack, FRAME_HDR
 
@@ -45,6 +46,19 @@ def recv_exact(sock, n):
         except ConnectionResetError:
             raise ConnectionError("Connection reset by peer")
     return buf
+
+
+def close_socket(sock):
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 class ClientProxy:
@@ -95,17 +109,15 @@ class ClientProxy:
         except Exception as e:
             safe_log_error(f"Error handling client {client_addr}: {str(e)}")
         finally:
-            if server_sock:
-                server_sock.close()
-            client_sock.close()
+            close_socket(server_sock)
+            close_socket(client_sock)
             logger.info(f"Client connection {client_addr} closed")
 
     def encrypt_and_send(self, session, sock, data, client_addr):
         """加密数据并通过Sovereign-Chain发送"""
         try:
-            current_seq = session.send_seq
+            current_seq, ct = session.encrypt_with_sequence(data)
             header = struct.pack(">Q", current_seq)
-            ct = session.encrypt(data)
             data_frame = b"DATA" + header + ct
             sock.sendall(pack(data_frame))
             return True
@@ -135,7 +147,7 @@ class ClientProxy:
                 return None
 
             try:
-                decrypted_data = session.decrypt(resp_ct)
+                decrypted_data = session.decrypt_with_sequence(resp_seq, resp_ct)
                 return decrypted_data
             except Exception as e:
                 safe_log_error(f"Decryption error for client {client_addr}: {str(e)}")
@@ -161,6 +173,9 @@ class ClientProxy:
 
         except Exception as e:
             safe_log_error(f"Client->Server forwarding error for {client_addr}: {str(e)}")
+        finally:
+            close_socket(client_sock)
+            close_socket(server_sock)
 
     def forward_server_to_client(self, client_sock, server_sock, session, client_addr):
         """将服务器数据转发到客户端（解密）"""
@@ -176,6 +191,9 @@ class ClientProxy:
 
         except Exception as e:
             safe_log_error(f"Server->Client forwarding error for {client_addr}: {str(e)}")
+        finally:
+            close_socket(server_sock)
+            close_socket(client_sock)
 
     def start(self):
         """启动客户端代理"""
@@ -219,10 +237,10 @@ class ClientProxy:
 def main():
     """主函数"""
     # 配置参数
-    LISTEN_HOST = '127.0.0.1'  # 监听地址（RDP客户端连接这里）
-    LISTEN_PORT = 443  # 监听端口（RDP默认端口）
-    SERVER_HOST = '127.0.0.1'  # Sovereign-Chain服务器地址
-    SERVER_PORT = 25555  # Sovereign-Chain服务器端口
+    LISTEN_HOST = os.getenv('SC_CLIENT_PROXY_LISTEN_HOST', '127.0.0.1')
+    LISTEN_PORT = int(os.getenv('SC_CLIENT_PROXY_LISTEN_PORT', '3398'))
+    SERVER_HOST = os.getenv('SC_SERVER_HOST', '127.0.0.1')
+    SERVER_PORT = int(os.getenv('SC_SERVER_PORT', '25558'))
 
     proxy = ClientProxy(
         listen_host=LISTEN_HOST,

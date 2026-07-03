@@ -17,7 +17,7 @@
 
   * 握手延迟从 2000ms 优化到 500-800ms
   * 网络往返次数减少 50%
-  * 向后兼容 SC-EE-1 协议
+  * 协议版本和密码套件显式绑定，拒绝旧协议降级
   * 异步计算和预计算优化
   
 * ✨ **优化七次握手**（Client ↔ Server）
@@ -35,7 +35,7 @@
   * 自建 CA（根 CA）
   * 服务端 / 客户端证书签发
   * 握手中双方证书验证与签名验证
-  * 支持匿名证书模式
+  * 匿名证书仅作为显式启用的兼容模式，默认关闭
 * ⚡ **高安全性**
 
   * HKDF-SHA256 派生会话密钥
@@ -44,7 +44,7 @@
   * 异步证书验证和密钥计算
 * 🔁 **中转代理（Proxy）支持**
 
-  * 新增 `client_proxy.py` 和 `proxy_server.py`，可在客户端和真实服务器之间作为中转
+  * `client_proxy.py` 和 `server_proxy.py` 可在客户端和真实服务器之间作为中转
   * 完整支持握手和加密通信
   * 支持透明数据转发，客户端无需修改原逻辑即可接入代理
   * 可用于负载分发、调试或隐藏真实服务器地址
@@ -53,7 +53,7 @@
   * 在握手阶段传输64字节种子码
   * 每条消息使用种子码+计数器派生独立密钥
   * 实现真正的消息级安全隔离
-  * 即使会话密钥泄露，也无法解密历史消息
+  * 使用单向密钥棘轮更新链密钥，不长期缓存旧共享秘密
 * 🔄 **异步优化**
 
   * 使用线程池进行并行计算
@@ -84,7 +84,7 @@
 ├── server.py        # 服务端 (优化版)
 ├── client.py        # 客户端 (优化版)
 ├── client_proxy.py  # 客户端中转代理
-├── proxy_server.py  # 代理服务端
+├── server_proxy.py  # 代理服务端
 ├── ca_cert.pem      # CA 根证书
 ├── ca_key.pem       # CA 私钥
 ├── server_cert.pem  # 服务端证书
@@ -126,7 +126,7 @@ python client.py
 启动代理服务端
 
 ```bash
-python proxy_server.py
+python server_proxy.py
 ```
 启动客户端代理
 ```bash
@@ -205,7 +205,7 @@ server: echo: test123
 4. **种子码动态加密（创新）**：
    * 每条消息使用种子码+计数器派生独立密钥
    * 实现真正的消息级安全隔离
-   * 即使会话密钥泄露，也无法解密历史消息
+   * 每次成功处理消息后单向推进链密钥，降低当前状态泄露对历史消息的影响
    * 破解单条消息不影响其他消息安全
 
 5. **加密与认证**：
@@ -219,7 +219,7 @@ server: echo: test123
    * 自签名 CA 根证书
    * 服务端/客户端证书包含 Ed25519 公钥
    * 握手中验证证书链和签名
-   * 支持匿名证书模式
+   * 匿名证书模式默认关闭，仅用于显式启用的兼容测试
 
 7. **中转代理设计**：
 
@@ -236,9 +236,39 @@ server: echo: test123
 
 ---
 
-## 向后兼容性
+## 协议兼容性
 
-SC-EE-2 协议与 SC-EE-1 保持向后兼容。新版本客户端可以与旧版本服务器握手，但会使用较慢的13步握手流程。建议同时升级客户端和服务器以获得最佳性能。
+安全加固版本只接受明确绑定协议版本和密码套件的 SC-EE-2 握手。客户端、服务端和代理必须同步升级；旧版 SC-EE-1/13步握手会被拒绝，以避免协议降级和两套握手实现长期分叉。
+
+升级后需要重新运行 `python ca.py`，生成包含 SAN 和 EKU 约束的新证书；旧版缺少这些扩展的终端证书会被拒绝。
+
+## 安全配置
+
+默认服务端身份是 `Sovereign-Chain-Server`，默认允许的客户端身份是 `Sovereign-Chain-Client`。部署时可通过环境变量覆盖：
+
+```text
+SC_SERVER_NAME=服务端证书中的SAN名称
+SC_ALLOWED_CLIENT_NAMES=允许的客户端SAN名称，多个名称用逗号分隔
+SC_CRL_FILE=可信CA发布的PEM或DER格式CRL文件
+SC_REQUIRE_CRL=1
+SC_CA_CERT_FILE=受控目录中的CA证书
+SC_SERVER_CERT_FILE=受控目录中的服务端证书
+SC_SERVER_KEY_FILE=受控目录中的服务端私钥
+SC_SERVER_KEY_PASSWORD=加密PEM私钥的密码
+SC_CLIENT_CERT_FILE=受控目录中的客户端证书
+SC_CLIENT_KEY_FILE=受控目录中的客户端私钥
+SC_CLIENT_KEY_PASSWORD=加密PEM私钥的密码
+```
+
+生产环境建议同时设置 `SC_CRL_FILE` 和 `SC_REQUIRE_CRL=1`，使吊销信息不可用时连接直接失败。匿名客户端默认禁用；仅兼容测试可设置 `SC_ALLOW_ANONYMOUS_CLIENTS=1`，不得向普通客户端分发匿名 CA 私钥。
+
+代理地址可通过 `SC_CLIENT_PROXY_*`、`SC_SERVER_HOST`、`SC_SERVER_PORT` 和 `SC_PROXY_*` 环境变量配置。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 

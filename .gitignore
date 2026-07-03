@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv*/
+.idea/
+.trae/
+build/
+dist/
+captures/
+*_key.pem
+key.pem
+hs_err_pid*.log
