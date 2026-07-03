@@ -275,7 +275,7 @@ def verify_client_certificate_async(client_cert_pem_bytes, ca_cert, transcript_h
 
 
 def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
-    """Perform the single supported SC-EE-2 handshake and return a session."""
+    """Perform the single supported SC-EE-3 handshake and return a session."""
     transcript_hash = hashes.Hash(hashes.SHA256(), backend=default_backend())
     handshake_start_time = time.time()
     futures = []
