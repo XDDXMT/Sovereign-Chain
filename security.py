@@ -1,8 +1,10 @@
 """Shared security primitives for the Sovereign-Chain protocol."""
 
 import datetime
+import hmac
 import ipaddress
 import os
+import secrets
 import struct
 import threading
 
@@ -15,9 +17,14 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 
-PROTO_VER = b"SC-EE-2"
+PROTO_VER = b"SC-EE-3"
 CIPHER_SUITE = b"X25519-Ed25519-CHACHA20POLY1305-HKDFSHA256"
 MAX_FRAME_SIZE = 1_000_000
+PADDING_MAGIC = b"P1"
+PADDING_HEADER = struct.Struct(">2sHI")
+MAX_ACCEPTED_PADDING = 256
+DEFAULT_MIN_PADDING = 0
+DEFAULT_MAX_PADDING = 32
 
 
 class CertificateValidationError(ValueError):
@@ -25,6 +32,10 @@ class CertificateValidationError(ValueError):
 
 
 class SequenceValidationError(ValueError):
+    pass
+
+
+class PaddingValidationError(ValueError):
     pass
 
 
@@ -227,7 +238,7 @@ def verify_private_key_matches_certificate(private_key, cert):
 
 
 class Session:
-    """Bidirectional AEAD session with synchronized, one-way key evolution."""
+    """Bidirectional AEAD session with key evolution and authenticated padding."""
 
     def __init__(self, send_key, recv_key, seed_code, role="client"):
         if len(send_key) != 32 or len(recv_key) != 32:
@@ -242,6 +253,7 @@ class Session:
         self.recv_seq = 1
         self._send_lock = threading.Lock()
         self._recv_lock = threading.Lock()
+        self._min_padding, self._max_padding = self._read_padding_bounds()
 
         if role == "client":
             self.send_label = b"client->server"
@@ -257,6 +269,81 @@ class Session:
         material = hkdf(chain_key, b"SC-RATCHET|" + context, length=64)
         return material[:32], material[32:]
 
+    @staticmethod
+    def _read_padding_bounds():
+        try:
+            minimum = int(os.getenv("SC_MIN_PADDING_BYTES", str(DEFAULT_MIN_PADDING)))
+            maximum = int(os.getenv("SC_MAX_PADDING_BYTES", str(DEFAULT_MAX_PADDING)))
+        except ValueError as exc:
+            raise ValueError("padding limits must be integers") from exc
+        if minimum < 0 or maximum > MAX_ACCEPTED_PADDING or minimum > maximum:
+            raise ValueError(
+                f"padding limits must satisfy 0 <= minimum <= maximum <= "
+                f"{MAX_ACCEPTED_PADDING}"
+            )
+        return minimum, maximum
+
+    def _derive_padding(self, sequence, label, padding_length, insertion_position):
+        if padding_length == 0:
+            return b""
+        context = (
+            b"SC-PADDING|"
+            + struct.pack(">Q", sequence)
+            + label
+            + struct.pack(">HI", padding_length, insertion_position)
+        )
+        return hkdf(self.seed_code, context, length=padding_length)
+
+    def _encode_padded(self, plaintext, sequence, label):
+        if not isinstance(plaintext, bytes):
+            raise TypeError("plaintext must be bytes")
+        padding_length = self._min_padding + secrets.randbelow(
+            self._max_padding - self._min_padding + 1
+        )
+        insertion_position = secrets.randbelow(len(plaintext) + 1)
+        padding = self._derive_padding(
+            sequence, label, padding_length, insertion_position
+        )
+        envelope_length = PADDING_HEADER.size + len(plaintext) + padding_length
+        if envelope_length + 16 > MAX_FRAME_SIZE:
+            raise ValueError("padded plaintext exceeds maximum frame size")
+        header = PADDING_HEADER.pack(
+            PADDING_MAGIC,
+            padding_length,
+            insertion_position,
+        )
+        return (
+            header
+            + plaintext[:insertion_position]
+            + padding
+            + plaintext[insertion_position:]
+        )
+
+    def _decode_padded(self, envelope, sequence, label):
+        if len(envelope) < PADDING_HEADER.size:
+            raise PaddingValidationError("padding envelope is truncated")
+        magic, padding_length, insertion_position = PADDING_HEADER.unpack_from(envelope)
+        if magic != PADDING_MAGIC:
+            raise PaddingValidationError("invalid padding envelope")
+        if padding_length > MAX_ACCEPTED_PADDING:
+            raise PaddingValidationError("padding length exceeds protocol limit")
+        original_length = len(envelope) - PADDING_HEADER.size - padding_length
+        if original_length < 0 or insertion_position > original_length:
+            raise PaddingValidationError("invalid padding insertion position or length")
+
+        padded_data = envelope[PADDING_HEADER.size:]
+        padding_end = insertion_position + padding_length
+        supplied_padding = padded_data[insertion_position:padding_end]
+        expected_padding = self._derive_padding(
+            sequence, label, padding_length, insertion_position
+        )
+        if not hmac.compare_digest(supplied_padding, expected_padding):
+            raise PaddingValidationError("seed-bound padding verification failed")
+        plaintext = padded_data[:insertion_position] + padded_data[padding_end:]
+        if len(plaintext) != original_length:
+            raise PaddingValidationError("decoded plaintext length mismatch")
+        return plaintext
+
     def encrypt(self, plaintext: bytes, aad: bytes = b""):
         return self.encrypt_with_sequence(plaintext, aad)[1]
 
@@ -267,7 +354,12 @@ class Session:
                 self._send_chain_key, sequence, self.send_label
             )
             nonce = nonce_from_seq(sequence, self.send_label)
-            ciphertext = ChaCha20Poly1305(message_key).encrypt(nonce, plaintext, aad)
+            padded_plaintext = self._encode_padded(
+                plaintext, sequence, self.send_label
+            )
+            ciphertext = ChaCha20Poly1305(message_key).encrypt(
+                nonce, padded_plaintext, aad
+            )
             self._send_chain_key = next_chain_key
             self.send_seq += 1
             return sequence, ciphertext
@@ -285,7 +377,12 @@ class Session:
                 self._recv_chain_key, sequence, self.recv_label
             )
             nonce = nonce_from_seq(sequence, self.recv_label)
-            plaintext = ChaCha20Poly1305(message_key).decrypt(nonce, ciphertext, aad)
+            padded_plaintext = ChaCha20Poly1305(message_key).decrypt(
+                nonce, ciphertext, aad
+            )
+            plaintext = self._decode_padded(
+                padded_plaintext, sequence, self.recv_label
+            )
             self._recv_chain_key = next_chain_key
             self.recv_seq += 1
             return plaintext

@@ -168,6 +168,35 @@ class SessionTests(unittest.TestCase):
             worker.join()
         self.assertEqual(sorted(sequences), list(range(1, 51)))
 
+    def test_identical_messages_have_variable_ciphertext_lengths(self):
+        environment = {
+            "SC_MIN_PADDING_BYTES": "0",
+            "SC_MAX_PADDING_BYTES": "32",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            client_session = Session(
+                b"a" * 32, b"b" * 32, b"s" * 64, role="client"
+            )
+            server_session = Session(
+                b"b" * 32, b"a" * 32, b"s" * 64, role="server"
+            )
+        lengths = set()
+        for _ in range(32):
+            ciphertext = client_session.encrypt(b"hello")
+            lengths.add(len(ciphertext))
+            self.assertEqual(server_session.decrypt(ciphertext), b"hello")
+        self.assertGreater(len(lengths), 1)
+
+    def test_fixed_padding_length_is_accounted_for(self):
+        environment = {
+            "SC_MIN_PADDING_BYTES": "17",
+            "SC_MAX_PADDING_BYTES": "17",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            session = Session(b"a" * 32, b"b" * 32, b"s" * 64, role="client")
+        ciphertext = session.encrypt(b"hello")
+        self.assertEqual(len(ciphertext), 8 + 5 + 17 + 16)
+
 
 class HandshakeIntegrationTests(unittest.TestCase):
     def test_server_rejects_unbound_legacy_client_hello(self):
@@ -187,7 +216,7 @@ class HandshakeIntegrationTests(unittest.TestCase):
             server_socket.close()
             client_socket.close()
 
-    def test_client_and_server_complete_sc_ee_2_handshake(self):
+    def test_client_and_server_complete_sc_ee_3_handshake(self):
         ca_cert, server_key, server_cert, client_key, client_cert = make_certificates()
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))

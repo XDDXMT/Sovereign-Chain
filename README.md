@@ -13,7 +13,7 @@
   * 使用 Ed25519 静态密钥进行身份签名
   * 使用 ChaCha20-Poly1305 进行 AEAD 加密
   * 使用 HKDF-SHA256 派生会话密钥
-* ⚡ **优化握手协议（SC-EE-2）**
+* ⚡ **安全加固握手协议（SC-EE-3）**
 
   * 握手延迟从 2000ms 优化到 500-800ms
   * 网络往返次数减少 50%
@@ -54,6 +54,8 @@
   * 每条消息使用种子码+计数器派生独立密钥
   * 实现真正的消息级安全隔离
   * 使用单向密钥棘轮更新链密钥，不长期缓存旧共享秘密
+  * 在每条明文的随机位置插入种子码绑定填充
+  * 使用短随机填充，使相同消息产生不同长度的密文
 * 🔄 **异步优化**
 
   * 使用线程池进行并行计算
@@ -143,7 +145,7 @@ sequenceDiagram
     participant Server
 
     Note over Client, Server: 天启御链优化加密握手步骤 (7步)
-    Note over Client, Server: 协议版本: SC-EE-2, 握手延迟: 500-800ms
+    Note over Client, Server: 协议版本: SC-EE-3, 握手延迟: 500-800ms
 
     Client->>Server: 1. CLIENTHELLO (client_eph_pub, nonce_c)
     Server->>Client: 2. SERVER_COMBINED (合并发送)
@@ -206,6 +208,9 @@ server: echo: test123
    * 每条消息使用种子码+计数器派生独立密钥
    * 实现真正的消息级安全隔离
    * 每次成功处理消息后单向推进链密钥，降低当前状态泄露对历史消息的影响
+   * 填充内容由种子码、序列号、方向标签和随机 nonce 派生
+   * 插入位置和短填充长度独立随机，兼顾流量混淆与传输效率
+   * 填充封装由 AEAD 一并认证，接收端严格验证长度和填充内容
    * 破解单条消息不影响其他消息安全
 
 5. **加密与认证**：
@@ -238,7 +243,7 @@ server: echo: test123
 
 ## 协议兼容性
 
-安全加固版本只接受明确绑定协议版本和密码套件的 SC-EE-2 握手。客户端、服务端和代理必须同步升级；旧版 SC-EE-1/13步握手会被拒绝，以避免协议降级和两套握手实现长期分叉。
+安全加固版本只接受明确绑定协议版本和密码套件的 SC-EE-3 握手。客户端、服务端和代理必须同步升级；旧版握手会被拒绝，以避免协议降级和填充格式混淆。
 
 升级后需要重新运行 `python ca.py`，生成包含 SAN 和 EKU 约束的新证书；旧版缺少这些扩展的终端证书会被拒绝。
 
@@ -258,6 +263,8 @@ SC_SERVER_KEY_PASSWORD=加密PEM私钥的密码
 SC_CLIENT_CERT_FILE=受控目录中的客户端证书
 SC_CLIENT_KEY_FILE=受控目录中的客户端私钥
 SC_CLIENT_KEY_PASSWORD=加密PEM私钥的密码
+SC_MIN_PADDING_BYTES=0
+SC_MAX_PADDING_BYTES=32
 ```
 
 生产环境建议同时设置 `SC_CRL_FILE` 和 `SC_REQUIRE_CRL=1`，使吊销信息不可用时连接直接失败。匿名客户端默认禁用；仅兼容测试可设置 `SC_ALLOW_ANONYMOUS_CLIENTS=1`，不得向普通客户端分发匿名 CA 私钥。
