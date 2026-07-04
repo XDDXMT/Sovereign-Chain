@@ -482,12 +482,20 @@ def client_handshake(host="127.0.0.1", port=5555, expected_server_name=None):
         k_c2s = okm[:32]
         k_s2c = okm[32:]
 
-        sess = Session(send_key=k_c2s, recv_key=k_s2c,
-                       seed_code=seed_data[8:72] if len(seed_data) >= 72 else seed_data[8:], role="client")
+        sess = Session(
+            send_key=k_c2s,
+            recv_key=k_s2c,
+            seed_code=seed_data[8:72] if len(seed_data) >= 72 else seed_data[8:],
+            role="client",
+            session_id=transcript,
+            cipher_suite=CIPHER_SUITE,
+        )
 
         ct = parse_protocol_frame(ack_frame, b"SECUREACK")
         try:
-            ack = sess.decrypt(ct, aad=transcript)
+            ack = sess.decrypt(
+                ct, aad=transcript, frame_type=b"SECUREACK"
+            )
             if ack != b"ACK":
                 raise ValueError("Invalid ACK value")
             logger.info("Secure ACK verified successfully")

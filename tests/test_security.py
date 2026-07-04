@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from cryptography import x509
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID
@@ -14,7 +15,12 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 import client
 import server
 from ca import build_cert
-from security import CertificateValidationError, Session, validate_peer_certificate
+from security import (
+    AES256_GCM_SIV_SUITE,
+    CertificateValidationError,
+    Session,
+    validate_peer_certificate,
+)
 
 
 def make_certificates():
@@ -151,6 +157,60 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self.server.decrypt(bytes(ciphertext))
         self.assertEqual(self.server.recv_seq, 1)
+
+    def test_frame_type_is_authenticated(self):
+        ciphertext = self.client.encrypt(
+            b"control payload", frame_type=b"CONTROL"
+        )
+        with self.assertRaises(InvalidTag):
+            self.server.decrypt(ciphertext, frame_type=b"DATA")
+        self.assertEqual(self.server.recv_seq, 1)
+
+    def test_session_identity_blocks_cross_session_replay(self):
+        sender = Session(
+            b"a" * 32,
+            b"b" * 32,
+            b"s" * 64,
+            role="client",
+            session_id=b"1" * 32,
+        )
+        wrong_session = Session(
+            b"b" * 32,
+            b"a" * 32,
+            b"s" * 64,
+            role="server",
+            session_id=b"2" * 32,
+        )
+        with self.assertRaises(InvalidTag):
+            wrong_session.decrypt(sender.encrypt(b"not reusable"))
+        self.assertEqual(wrong_session.recv_seq, 1)
+
+    def test_aes_256_gcm_siv_bidirectional_key_evolution(self):
+        seed = b"s" * 64
+        client_session = Session(
+            b"a" * 32,
+            b"b" * 32,
+            seed,
+            role="client",
+            cipher_suite=AES256_GCM_SIV_SUITE,
+        )
+        server_session = Session(
+            b"b" * 32,
+            b"a" * 32,
+            seed,
+            role="server",
+            cipher_suite=AES256_GCM_SIV_SUITE,
+        )
+        for index in range(10):
+            plaintext = f"aes-message-{index}".encode()
+            self.assertEqual(
+                server_session.decrypt(client_session.encrypt(plaintext)),
+                plaintext,
+            )
+            self.assertEqual(
+                client_session.decrypt(server_session.encrypt(plaintext)),
+                plaintext,
+            )
 
     def test_sequence_assignment_is_atomic(self):
         sequences = []

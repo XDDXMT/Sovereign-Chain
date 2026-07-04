@@ -11,13 +11,14 @@
 
   * 使用 X25519 进行临时密钥交换
   * 使用 Ed25519 静态密钥进行身份签名
-  * 使用 ChaCha20-Poly1305 进行 AEAD 加密
+  * 默认使用 ChaCha20-Poly1305，并可显式选择 AES-256-GCM-SIV
   * 使用 HKDF-SHA256 派生会话密钥
 * ⚡ **安全加固握手协议（SC-EE-3）**
 
   * 握手延迟从 2000ms 优化到 500-800ms
   * 网络往返次数减少 50%
   * 协议版本和密码套件显式绑定，拒绝旧协议降级
+  * AEAD 认证协议版本、密码套件、会话身份、方向、消息类型、序列号和密钥世代
   * 异步计算和预计算优化
   
 * ✨ **优化七次握手**（Client ↔ Server）
@@ -208,14 +209,15 @@ server: echo: test123
    * 每条消息使用种子码+计数器派生独立密钥
    * 实现真正的消息级安全隔离
    * 每次成功处理消息后单向推进链密钥，降低当前状态泄露对历史消息的影响
-   * 填充内容由种子码、序列号、方向标签和随机 nonce 派生
+   * 单次 HKDF 同时派生消息密钥、下一链密钥和短填充材料，减少重复派生开销
    * 插入位置和短填充长度独立随机，兼顾流量混淆与传输效率
    * 填充封装由 AEAD 一并认证，接收端严格验证长度和填充内容
    * 破解单条消息不影响其他消息安全
 
 5. **加密与认证**：
 
-   * 使用 ChaCha20-Poly1305 进行 AEAD 加密
+   * 默认使用 ChaCha20-Poly1305；支持按部署选择 AES-256-GCM-SIV
+   * 协议和会话元数据作为 AEAD AAD 认证，不增加线路字节
    * 每条消息包含唯一序列号防止重放攻击
    * 握手记录签名防止篡改
 
@@ -263,9 +265,12 @@ SC_SERVER_KEY_PASSWORD=加密PEM私钥的密码
 SC_CLIENT_CERT_FILE=受控目录中的客户端证书
 SC_CLIENT_KEY_FILE=受控目录中的客户端私钥
 SC_CLIENT_KEY_PASSWORD=加密PEM私钥的密码
+SC_CIPHER_SUITE=CHACHA20-POLY1305
 SC_MIN_PADDING_BYTES=0
 SC_MAX_PADDING_BYTES=32
 ```
+
+`SC_CIPHER_SUITE` 可设为 `CHACHA20-POLY1305`（默认）或 `AES-256-GCM-SIV`。客户端与服务端必须配置相同值；套件名会进入握手记录和密钥上下文，配置不一致时连接会被拒绝。AES-256-GCM-SIV 需要 `cryptography >= 42.0.0` 以及其底层 OpenSSL 支持。
 
 生产环境建议同时设置 `SC_CRL_FILE` 和 `SC_REQUIRE_CRL=1`，使吊销信息不可用时连接直接失败。匿名客户端默认禁用；仅兼容测试可设置 `SC_ALLOW_ANONYMOUS_CLIENTS=1`，不得向普通客户端分发匿名 CA 私钥。
 

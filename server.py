@@ -393,8 +393,12 @@ def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
             recv_key=session_keys[:32],
             seed_code=seed_code,
             role="server",
+            session_id=transcript,
+            cipher_suite=CIPHER_SUITE,
         )
-        ack = session.encrypt(b"ACK", aad=transcript)
+        ack = session.encrypt(
+            b"ACK", aad=transcript, frame_type=b"SECUREACK"
+        )
         send_frame(conn, b"SECUREACK|" + ack)
         conn.settimeout(None)
         logger.info(
