@@ -12,7 +12,6 @@ import random
 import socket, struct, os, threading, time, logging, math, secrets
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
@@ -25,6 +24,7 @@ from security import (
     CIPHER_SUITE,
     PROTO_VER,
     Session,
+    create_aead,
     hkdf,
     validate_ca_certificate,
     validate_peer_certificate,
@@ -347,7 +347,7 @@ def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
             b"SC-HKDF|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|" + nonce_c + b"|" + nonce_s
         )
         temporary_keys = hkdf(shared, key_context, length=64)
-        encrypted_seed = ChaCha20Poly1305(temporary_keys[32:]).encrypt(
+        encrypted_seed = create_aead(temporary_keys[32:], CIPHER_SUITE).encrypt(
             transcript[:12],
             b"SEEDCODE|" + seed_nonce + seed_code + order_seed,
             transcript,

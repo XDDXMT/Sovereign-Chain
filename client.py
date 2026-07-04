@@ -7,7 +7,6 @@ import random
 import socket, struct, os, time, logging, math, secrets, hashlib, traceback
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
@@ -20,6 +19,7 @@ from security import (
     CIPHER_SUITE,
     PROTO_VER,
     Session,
+    create_aead,
     hkdf,
     validate_peer_certificate,
     verify_private_key_matches_certificate,
@@ -396,7 +396,7 @@ def client_handshake(host="127.0.0.1", port=5555, expected_server_name=None):
         temp_key = hkdf(shared, info, length=64)
         k_s2c = temp_key[32:]
 
-        temp_aead = ChaCha20Poly1305(k_s2c)
+        temp_aead = create_aead(k_s2c, CIPHER_SUITE)
         temp_nonce = transcript[:12]
 
         try:

@@ -57,6 +57,19 @@ class PaddingValidationError(ValueError):
     pass
 
 
+def create_aead(key, cipher_suite=None):
+    selected_suite = CIPHER_SUITE if cipher_suite is None else cipher_suite
+    if selected_suite == CHACHA20_SUITE:
+        return ChaCha20Poly1305(key)
+    if selected_suite != AES256_GCM_SIV_SUITE:
+        raise ValueError("unsupported AEAD cipher suite")
+    if AESGCMSIV is None:
+        raise RuntimeError(
+            "AES-256-GCM-SIV requires cryptography 42.0.0 or newer"
+        )
+    return AESGCMSIV(key)
+
+
 def hkdf(ikm, info, length=64):
     return HKDF(
         algorithm=hashes.SHA256(),
@@ -334,13 +347,7 @@ class Session:
         )
 
     def _new_aead(self, key):
-        if self.cipher_suite == CHACHA20_SUITE:
-            return ChaCha20Poly1305(key)
-        if AESGCMSIV is None:
-            raise RuntimeError(
-                "AES-256-GCM-SIV requires cryptography 42.0.0 or newer"
-            )
-        return AESGCMSIV(key)
+        return create_aead(key, self.cipher_suite)
 
     @staticmethod
     def _read_padding_bounds():

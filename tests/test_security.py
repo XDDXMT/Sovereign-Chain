@@ -259,6 +259,73 @@ class SessionTests(unittest.TestCase):
 
 
 class HandshakeIntegrationTests(unittest.TestCase):
+    def _complete_handshake(self, cipher_suite):
+        ca_cert, server_key, server_cert, client_key, client_cert = make_certificates()
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        outcome = {}
+        client_aead = mock.Mock(wraps=client.create_aead)
+        server_aead = mock.Mock(wraps=server.create_aead)
+
+        def accept_connection():
+            connection, address = listener.accept()
+            try:
+                outcome["session"] = server.server_handshake(
+                    connection,
+                    address,
+                    server_key,
+                    server_cert,
+                    ca_cert,
+                )
+            except Exception as exc:
+                outcome["error"] = exc
+            finally:
+                connection.close()
+
+        client_hello_prefix = (
+            b"CLIENTHELLO|" + client.PROTO_VER + b"|" + cipher_suite + b"|"
+        )
+        server_hello_prefix = (
+            b"SERVERHELLO|" + client.PROTO_VER + b"|" + cipher_suite + b"|"
+        )
+        environment = {
+            "SC_SERVER_NAME": "Sovereign-Chain-Server",
+            "SC_ALLOWED_CLIENT_NAMES": "Sovereign-Chain-Client",
+        }
+        try:
+            with mock.patch.dict(os.environ, environment, clear=False), \
+                    mock.patch.multiple(
+                        client,
+                        CIPHER_SUITE=cipher_suite,
+                        CLIENT_HELLO_PREFIX=client_hello_prefix,
+                        SERVER_HELLO_PREFIX=server_hello_prefix,
+                        create_aead=client_aead,
+                    ), \
+                    mock.patch.multiple(
+                        server,
+                        CIPHER_SUITE=cipher_suite,
+                        CLIENT_HELLO_PREFIX=client_hello_prefix,
+                        SERVER_HELLO_PREFIX=server_hello_prefix,
+                        create_aead=server_aead,
+                    ), \
+                    mock.patch.object(client, "load_priv", return_value=client_key), \
+                    mock.patch.object(client, "load_cert", return_value=client_cert), \
+                    mock.patch.object(client, "load_ca_cert", return_value=ca_cert):
+                worker = threading.Thread(target=accept_connection)
+                worker.start()
+                client_session, client_socket = client.client_handshake(
+                    "127.0.0.1", port
+                )
+                client_socket.close()
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", outcome)
+            return client_session, outcome["session"], client_aead, server_aead
+        finally:
+            listener.close()
+
     def test_server_rejects_unbound_legacy_client_hello(self):
         ca_cert, server_key, server_cert, _, _ = make_certificates()
         server_socket, client_socket = socket.socketpair()
@@ -277,48 +344,24 @@ class HandshakeIntegrationTests(unittest.TestCase):
             client_socket.close()
 
     def test_client_and_server_complete_sc_ee_3_handshake(self):
-        ca_cert, server_key, server_cert, client_key, client_cert = make_certificates()
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        port = listener.getsockname()[1]
-        outcome = {}
+        client_session, server_session, client_aead, server_aead = (
+            self._complete_handshake(client.CIPHER_SUITE)
+        )
+        self.assertEqual(client_session.send_seq, 1)
+        self.assertEqual(server_session.recv_seq, 1)
+        self.assertEqual(client_aead.call_args.args[1], client.CIPHER_SUITE)
+        self.assertEqual(server_aead.call_args.args[1], server.CIPHER_SUITE)
 
-        def accept_connection():
-            connection, address = listener.accept()
-            try:
-                outcome["session"] = server.server_handshake(
-                    connection,
-                    address,
-                    server_key,
-                    server_cert,
-                    ca_cert,
-                )
-            except Exception as exc:
-                outcome["error"] = exc
-            finally:
-                connection.close()
-
-        worker = threading.Thread(target=accept_connection)
-        worker.start()
-        environment = {
-            "SC_SERVER_NAME": "Sovereign-Chain-Server",
-            "SC_ALLOWED_CLIENT_NAMES": "Sovereign-Chain-Client",
-        }
-        try:
-            with mock.patch.dict(os.environ, environment, clear=False), \
-                    mock.patch.object(client, "load_priv", return_value=client_key), \
-                    mock.patch.object(client, "load_cert", return_value=client_cert), \
-                    mock.patch.object(client, "load_ca_cert", return_value=ca_cert):
-                client_session, client_socket = client.client_handshake("127.0.0.1", port)
-                client_socket.close()
-            worker.join(timeout=5)
-            self.assertFalse(worker.is_alive())
-            self.assertNotIn("error", outcome)
-            self.assertEqual(client_session.send_seq, 1)
-            self.assertEqual(outcome["session"].recv_seq, 1)
-        finally:
-            listener.close()
+    def test_aes_suite_protects_seed_stage_and_session(self):
+        client_session, server_session, client_aead, server_aead = (
+            self._complete_handshake(AES256_GCM_SIV_SUITE)
+        )
+        self.assertEqual(client_session.cipher_suite, AES256_GCM_SIV_SUITE)
+        self.assertEqual(server_session.cipher_suite, AES256_GCM_SIV_SUITE)
+        client_aead.assert_called_once()
+        server_aead.assert_called_once()
+        self.assertEqual(client_aead.call_args.args[1], AES256_GCM_SIV_SUITE)
+        self.assertEqual(server_aead.call_args.args[1], AES256_GCM_SIV_SUITE)
 
 
 if __name__ == "__main__":

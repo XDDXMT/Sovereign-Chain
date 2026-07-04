@@ -270,7 +270,7 @@ SC_MIN_PADDING_BYTES=0
 SC_MAX_PADDING_BYTES=32
 ```
 
-`SC_CIPHER_SUITE` 可设为 `CHACHA20-POLY1305`（默认）或 `AES-256-GCM-SIV`。客户端与服务端必须配置相同值；套件名会进入握手记录和密钥上下文，配置不一致时连接会被拒绝。AES-256-GCM-SIV 需要 `cryptography >= 42.0.0` 以及其底层 OpenSSL 支持。
+`SC_CIPHER_SUITE` 可设为 `CHACHA20-POLY1305`（默认）或 `AES-256-GCM-SIV`。选择的套件同时用于握手种子码阶段和后续会话消息。客户端与服务端必须配置相同值；套件名会进入握手记录和密钥上下文，配置不一致时连接会被拒绝。AES-256-GCM-SIV 需要 `cryptography >= 42.0.0` 以及其底层 OpenSSL 支持。
 
 生产环境建议同时设置 `SC_CRL_FILE` 和 `SC_REQUIRE_CRL=1`，使吊销信息不可用时连接直接失败。匿名客户端默认禁用；仅兼容测试可设置 `SC_ALLOW_ANONYMOUS_CLIENTS=1`，不得向普通客户端分发匿名 CA 私钥。
 
