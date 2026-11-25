@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sovereign-chain"
+version = "2.1.0.dev0"
+description = "SC-EE-3 mutually authenticated TCP sessions and bounded TCP relays"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=42.0.0"]
+license-files = ["LICENSE"]
+
+[project.scripts]
+sovereign-chain = "sovereign_chain.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["sovereign_chain"]
+include-package-data = false

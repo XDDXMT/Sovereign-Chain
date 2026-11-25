@@ -31,13 +31,12 @@ _CIPHER_ALIASES = {
     "AES-256-GCM-SIV": AES256_GCM_SIV_SUITE,
     "AES256-GCM-SIV": AES256_GCM_SIV_SUITE,
 }
-_configured_cipher = os.getenv(
-    "SC_CIPHER_SUITE", "CHACHA20-POLY1305"
-).strip().upper()
+_configured_cipher = os.getenv("SC_CIPHER_SUITE", "CHACHA20-POLY1305").strip().upper()
 if _configured_cipher not in _CIPHER_ALIASES:
     raise RuntimeError(f"unsupported SC_CIPHER_SUITE: {_configured_cipher}")
 CIPHER_SUITE = _CIPHER_ALIASES[_configured_cipher]
 MAX_FRAME_SIZE = 1_000_000
+RECORD_HEADER_SIZE = 12  # Four-byte type and eight-byte sequence are inside the frame.
 PADDING_MAGIC = b"P1"
 PADDING_HEADER = struct.Struct(">2sHI")
 MAX_ACCEPTED_PADDING = 256
@@ -64,9 +63,7 @@ def create_aead(key, cipher_suite=None):
     if selected_suite != AES256_GCM_SIV_SUITE:
         raise ValueError("unsupported AEAD cipher suite")
     if AESGCMSIV is None:
-        raise RuntimeError(
-            "AES-256-GCM-SIV requires cryptography 42.0.0 or newer"
-        )
+        raise RuntimeError("AES-256-GCM-SIV requires cryptography 42.0.0 or newer")
     return AESGCMSIV(key)
 
 
@@ -85,7 +82,9 @@ def nonce_from_seq(seq: int, label: bytes):
     return digest.finalize()[:4] + struct.pack(">Q", seq)
 
 
-def _verify_signature(public_key, signature, signed_data, hash_algorithm, parameters=None):
+def _verify_signature(
+    public_key, signature, signed_data, hash_algorithm, parameters=None
+):
     try:
         if isinstance(public_key, ed25519.Ed25519PublicKey):
             public_key.verify(signature, signed_data)
@@ -102,7 +101,9 @@ def _verify_signature(public_key, signature, signed_data, hash_algorithm, parame
             public_key.verify(
                 signature,
                 signed_data,
-                parameters if isinstance(parameters, ec.ECDSA) else ec.ECDSA(hash_algorithm),
+                parameters
+                if isinstance(parameters, ec.ECDSA)
+                else ec.ECDSA(hash_algorithm),
             )
         else:
             raise CertificateValidationError("unsupported certificate signing key")
@@ -125,7 +126,9 @@ def check_certificate_revocation(cert, issuer_cert):
     required = os.getenv("SC_REQUIRE_CRL") == "1"
     if not crl_path:
         if required:
-            raise CertificateValidationError("CRL checking is required but SC_CRL_FILE is unset")
+            raise CertificateValidationError(
+                "CRL checking is required but SC_CRL_FILE is unset"
+            )
         return
 
     try:
@@ -165,7 +168,9 @@ def _utc(value):
 
 
 def _validate_time(cert, now):
-    not_before = getattr(cert, "not_valid_before_utc", None) or _utc(cert.not_valid_before)
+    not_before = getattr(cert, "not_valid_before_utc", None) or _utc(
+        cert.not_valid_before
+    )
     not_after = getattr(cert, "not_valid_after_utc", None) or _utc(cert.not_valid_after)
     if now < not_before:
         raise CertificateValidationError("certificate is not yet valid")
@@ -185,7 +190,9 @@ def _validate_identity(cert, expected_identity):
     try:
         san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     except x509.ExtensionNotFound as exc:
-        raise CertificateValidationError("peer certificate lacks SubjectAlternativeName") from exc
+        raise CertificateValidationError(
+            "peer certificate lacks SubjectAlternativeName"
+        ) from exc
     if expected_ip is not None:
         matches = expected_ip in san.get_values_for_type(x509.IPAddress)
     else:
@@ -202,10 +209,14 @@ def validate_ca_certificate(ca_cert, issuer_cert=None, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     _validate_time(ca_cert, now)
     try:
-        constraints = ca_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        constraints = ca_cert.extensions.get_extension_for_class(
+            x509.BasicConstraints
+        ).value
         usage = ca_cert.extensions.get_extension_for_class(x509.KeyUsage).value
     except x509.ExtensionNotFound as exc:
-        raise CertificateValidationError("CA certificate lacks required constraints") from exc
+        raise CertificateValidationError(
+            "CA certificate lacks required constraints"
+        ) from exc
     if not constraints.ca or not usage.key_cert_sign:
         raise CertificateValidationError("issuer certificate is not authorized as a CA")
     if issuer_cert is not None:
@@ -227,9 +238,13 @@ def validate_peer_certificate(cert, ca_cert, role, expected_identity=None, now=N
     check_certificate_revocation(cert, ca_cert)
 
     try:
-        constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        constraints = cert.extensions.get_extension_for_class(
+            x509.BasicConstraints
+        ).value
     except x509.ExtensionNotFound as exc:
-        raise CertificateValidationError("peer certificate lacks BasicConstraints") from exc
+        raise CertificateValidationError(
+            "peer certificate lacks BasicConstraints"
+        ) from exc
     if constraints.ca:
         raise CertificateValidationError("a CA certificate cannot authenticate a peer")
 
@@ -241,15 +256,20 @@ def validate_peer_certificate(cert, ca_cert, role, expected_identity=None, now=N
         raise CertificateValidationError("peer certificate cannot create signatures")
 
     required_eku = (
-        ExtendedKeyUsageOID.SERVER_AUTH if role == "server"
+        ExtendedKeyUsageOID.SERVER_AUTH
+        if role == "server"
         else ExtendedKeyUsageOID.CLIENT_AUTH
     )
     try:
         eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
     except x509.ExtensionNotFound as exc:
-        raise CertificateValidationError("peer certificate lacks ExtendedKeyUsage") from exc
+        raise CertificateValidationError(
+            "peer certificate lacks ExtendedKeyUsage"
+        ) from exc
     if required_eku not in eku:
-        raise CertificateValidationError(f"certificate is not valid for {role} authentication")
+        raise CertificateValidationError(
+            f"certificate is not valid for {role} authentication"
+        )
 
     _validate_identity(cert, expected_identity)
     return cert
@@ -318,11 +338,13 @@ class Session:
             raise ValueError("invalid session role")
 
     def _derive_keys(self, chain_key, seq, label):
+        # Separate message key, next chain key and padding material with one HKDF expansion.
         context = self.seed_code + struct.pack(">Q", seq) + label
         material = hkdf(chain_key, b"SC-RATCHET|" + context, length=96)
         return material[:32], material[32:64], material[64:96]
 
     def _build_aad(self, sequence, label, frame_type, external_aad):
+        # Authenticate the record type and direction before advancing the receive chain.
         if not isinstance(frame_type, bytes) or not frame_type:
             raise ValueError("frame type must be non-empty bytes")
         if len(frame_type) > 255:
@@ -387,7 +409,7 @@ class Session:
             padding_material, padding_length, insertion_position
         )
         envelope_length = PADDING_HEADER.size + len(plaintext) + padding_length
-        if envelope_length + 16 > MAX_FRAME_SIZE:
+        if RECORD_HEADER_SIZE + envelope_length + 16 > MAX_FRAME_SIZE:
             raise ValueError("padded plaintext exceeds maximum frame size")
         header = PADDING_HEADER.pack(
             PADDING_MAGIC,
@@ -413,7 +435,7 @@ class Session:
         if original_length < 0 or insertion_position > original_length:
             raise PaddingValidationError("invalid padding insertion position or length")
 
-        padded_data = envelope[PADDING_HEADER.size:]
+        padded_data = envelope[PADDING_HEADER.size :]
         padding_end = insertion_position + padding_length
         supplied_padding = padded_data[insertion_position:padding_end]
         expected_padding = self._derive_padding(
@@ -453,9 +475,7 @@ class Session:
             return sequence, ciphertext
 
     def decrypt(self, ciphertext: bytes, aad: bytes = b"", frame_type: bytes = b"DATA"):
-        return self.decrypt_with_sequence(
-            self.recv_seq, ciphertext, aad, frame_type
-        )
+        return self.decrypt_with_sequence(self.recv_seq, ciphertext, aad, frame_type)
 
     def decrypt_with_sequence(
         self,

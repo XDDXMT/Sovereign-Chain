@@ -12,15 +12,15 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-import client
-import server
-from ca import build_cert
-from security import (
+from sovereign_chain import client, server
+from sovereign_chain.pki import build_cert
+from sovereign_chain.security import (
     AES256_GCM_SIV_SUITE,
     CertificateValidationError,
     Session,
     validate_peer_certificate,
 )
+from sovereign_chain.wire import pack
 
 
 def make_certificates():
@@ -86,9 +86,13 @@ class CertificateValidationTests(unittest.TestCase):
             validate_peer_certificate(self.client_cert, self.ca, role="server")
 
     def test_rejects_expired_certificate(self):
-        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=8)
+        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            days=8
+        )
         with self.assertRaises(CertificateValidationError):
-            validate_peer_certificate(self.server_cert, self.ca, role="server", now=future)
+            validate_peer_certificate(
+                self.server_cert, self.ca, role="server", now=future
+            )
 
     def test_rejects_revoked_certificate(self):
         ca_key = ed25519.Ed25519PrivateKey.generate()
@@ -148,20 +152,22 @@ class SessionTests(unittest.TestCase):
     def test_bidirectional_key_evolution(self):
         for index in range(10):
             plaintext = f"message-{index}".encode()
-            self.assertEqual(self.server.decrypt(self.client.encrypt(plaintext)), plaintext)
-            self.assertEqual(self.client.decrypt(self.server.encrypt(plaintext)), plaintext)
+            self.assertEqual(
+                self.server.decrypt(self.client.encrypt(plaintext)), plaintext
+            )
+            self.assertEqual(
+                self.client.decrypt(self.server.encrypt(plaintext)), plaintext
+            )
 
     def test_tamper_does_not_advance_receive_chain(self):
         ciphertext = bytearray(self.client.encrypt(b"authenticated"))
         ciphertext[-1] ^= 1
-        with self.assertRaises(Exception):
+        with self.assertRaises(InvalidTag):
             self.server.decrypt(bytes(ciphertext))
         self.assertEqual(self.server.recv_seq, 1)
 
     def test_frame_type_is_authenticated(self):
-        ciphertext = self.client.encrypt(
-            b"control payload", frame_type=b"CONTROL"
-        )
+        ciphertext = self.client.encrypt(b"control payload", frame_type=b"CONTROL")
         with self.assertRaises(InvalidTag):
             self.server.decrypt(ciphertext, frame_type=b"DATA")
         self.assertEqual(self.server.recv_seq, 1)
@@ -221,7 +227,10 @@ class SessionTests(unittest.TestCase):
             with lock:
                 sequences.append(sequence)
 
-        workers = [threading.Thread(target=encrypt_message, args=(index,)) for index in range(50)]
+        workers = [
+            threading.Thread(target=encrypt_message, args=(index,))
+            for index in range(50)
+        ]
         for worker in workers:
             worker.start()
         for worker in workers:
@@ -234,12 +243,8 @@ class SessionTests(unittest.TestCase):
             "SC_MAX_PADDING_BYTES": "32",
         }
         with mock.patch.dict(os.environ, environment, clear=False):
-            client_session = Session(
-                b"a" * 32, b"b" * 32, b"s" * 64, role="client"
-            )
-            server_session = Session(
-                b"b" * 32, b"a" * 32, b"s" * 64, role="server"
-            )
+            client_session = Session(b"a" * 32, b"b" * 32, b"s" * 64, role="client")
+            server_session = Session(b"b" * 32, b"a" * 32, b"s" * 64, role="server")
         lengths = set()
         for _ in range(32):
             ciphertext = client_session.encrypt(b"hello")
@@ -295,24 +300,28 @@ class HandshakeIntegrationTests(unittest.TestCase):
             "SC_ALLOWED_CLIENT_NAMES": "Sovereign-Chain-Client",
         }
         try:
-            with mock.patch.dict(os.environ, environment, clear=False), \
-                    mock.patch.multiple(
-                        client,
-                        CIPHER_SUITE=cipher_suite,
-                        CLIENT_HELLO_PREFIX=client_hello_prefix,
-                        SERVER_HELLO_PREFIX=server_hello_prefix,
-                        create_aead=client_aead,
-                    ), \
-                    mock.patch.multiple(
-                        server,
-                        CIPHER_SUITE=cipher_suite,
-                        CLIENT_HELLO_PREFIX=client_hello_prefix,
-                        SERVER_HELLO_PREFIX=server_hello_prefix,
-                        create_aead=server_aead,
-                    ), \
-                    mock.patch.object(client, "load_priv", return_value=client_key), \
-                    mock.patch.object(client, "load_cert", return_value=client_cert), \
-                    mock.patch.object(client, "load_ca_cert", return_value=ca_cert):
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.multiple(
+                    client,
+                    CIPHER_SUITE=cipher_suite,
+                    CLIENT_HELLO_PREFIX=client_hello_prefix,
+                    SERVER_HELLO_PREFIX=server_hello_prefix,
+                    create_aead=client_aead,
+                ),
+                mock.patch.multiple(
+                    server,
+                    CIPHER_SUITE=cipher_suite,
+                    CLIENT_HELLO_PREFIX=client_hello_prefix,
+                    SERVER_HELLO_PREFIX=server_hello_prefix,
+                    create_aead=server_aead,
+                ),
+                mock.patch.object(
+                    client,
+                    "load_client_credentials",
+                    return_value=(client_key, client_cert, ca_cert),
+                ),
+            ):
                 worker = threading.Thread(target=accept_connection)
                 worker.start()
                 client_session, client_socket = client.client_handshake(
@@ -330,7 +339,7 @@ class HandshakeIntegrationTests(unittest.TestCase):
         ca_cert, server_key, server_cert, _, _ = make_certificates()
         server_socket, client_socket = socket.socketpair()
         try:
-            client_socket.sendall(server.pack(b"CLIENTHELLO|" + os.urandom(48)))
+            client_socket.sendall(pack(b"CLIENTHELLO|" + os.urandom(48)))
             with self.assertRaises(server.ProtocolError):
                 server.server_handshake(
                     server_socket,
