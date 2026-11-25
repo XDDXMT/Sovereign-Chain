@@ -7,14 +7,20 @@ import unittest
 from unittest import mock
 
 from cryptography import x509
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-import client
-import server
-from ca import build_cert
-from security import CertificateValidationError, Session, validate_peer_certificate
+from sovereign_chain import client, server
+from sovereign_chain.pki import build_cert
+from sovereign_chain.security import (
+    AES256_GCM_SIV_SUITE,
+    CertificateValidationError,
+    Session,
+    validate_peer_certificate,
+)
+from sovereign_chain.wire import pack
 
 
 def make_certificates():
@@ -80,9 +86,13 @@ class CertificateValidationTests(unittest.TestCase):
             validate_peer_certificate(self.client_cert, self.ca, role="server")
 
     def test_rejects_expired_certificate(self):
-        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=8)
+        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            days=8
+        )
         with self.assertRaises(CertificateValidationError):
-            validate_peer_certificate(self.server_cert, self.ca, role="server", now=future)
+            validate_peer_certificate(
+                self.server_cert, self.ca, role="server", now=future
+            )
 
     def test_rejects_revoked_certificate(self):
         ca_key = ed25519.Ed25519PrivateKey.generate()
@@ -142,15 +152,71 @@ class SessionTests(unittest.TestCase):
     def test_bidirectional_key_evolution(self):
         for index in range(10):
             plaintext = f"message-{index}".encode()
-            self.assertEqual(self.server.decrypt(self.client.encrypt(plaintext)), plaintext)
-            self.assertEqual(self.client.decrypt(self.server.encrypt(plaintext)), plaintext)
+            self.assertEqual(
+                self.server.decrypt(self.client.encrypt(plaintext)), plaintext
+            )
+            self.assertEqual(
+                self.client.decrypt(self.server.encrypt(plaintext)), plaintext
+            )
 
     def test_tamper_does_not_advance_receive_chain(self):
         ciphertext = bytearray(self.client.encrypt(b"authenticated"))
         ciphertext[-1] ^= 1
-        with self.assertRaises(Exception):
+        with self.assertRaises(InvalidTag):
             self.server.decrypt(bytes(ciphertext))
         self.assertEqual(self.server.recv_seq, 1)
+
+    def test_frame_type_is_authenticated(self):
+        ciphertext = self.client.encrypt(b"control payload", frame_type=b"CONTROL")
+        with self.assertRaises(InvalidTag):
+            self.server.decrypt(ciphertext, frame_type=b"DATA")
+        self.assertEqual(self.server.recv_seq, 1)
+
+    def test_session_identity_blocks_cross_session_replay(self):
+        sender = Session(
+            b"a" * 32,
+            b"b" * 32,
+            b"s" * 64,
+            role="client",
+            session_id=b"1" * 32,
+        )
+        wrong_session = Session(
+            b"b" * 32,
+            b"a" * 32,
+            b"s" * 64,
+            role="server",
+            session_id=b"2" * 32,
+        )
+        with self.assertRaises(InvalidTag):
+            wrong_session.decrypt(sender.encrypt(b"not reusable"))
+        self.assertEqual(wrong_session.recv_seq, 1)
+
+    def test_aes_256_gcm_siv_bidirectional_key_evolution(self):
+        seed = b"s" * 64
+        client_session = Session(
+            b"a" * 32,
+            b"b" * 32,
+            seed,
+            role="client",
+            cipher_suite=AES256_GCM_SIV_SUITE,
+        )
+        server_session = Session(
+            b"b" * 32,
+            b"a" * 32,
+            seed,
+            role="server",
+            cipher_suite=AES256_GCM_SIV_SUITE,
+        )
+        for index in range(10):
+            plaintext = f"aes-message-{index}".encode()
+            self.assertEqual(
+                server_session.decrypt(client_session.encrypt(plaintext)),
+                plaintext,
+            )
+            self.assertEqual(
+                client_session.decrypt(server_session.encrypt(plaintext)),
+                plaintext,
+            )
 
     def test_sequence_assignment_is_atomic(self):
         sequences = []
@@ -161,7 +227,10 @@ class SessionTests(unittest.TestCase):
             with lock:
                 sequences.append(sequence)
 
-        workers = [threading.Thread(target=encrypt_message, args=(index,)) for index in range(50)]
+        workers = [
+            threading.Thread(target=encrypt_message, args=(index,))
+            for index in range(50)
+        ]
         for worker in workers:
             worker.start()
         for worker in workers:
@@ -174,12 +243,8 @@ class SessionTests(unittest.TestCase):
             "SC_MAX_PADDING_BYTES": "32",
         }
         with mock.patch.dict(os.environ, environment, clear=False):
-            client_session = Session(
-                b"a" * 32, b"b" * 32, b"s" * 64, role="client"
-            )
-            server_session = Session(
-                b"b" * 32, b"a" * 32, b"s" * 64, role="server"
-            )
+            client_session = Session(b"a" * 32, b"b" * 32, b"s" * 64, role="client")
+            server_session = Session(b"b" * 32, b"a" * 32, b"s" * 64, role="server")
         lengths = set()
         for _ in range(32):
             ciphertext = client_session.encrypt(b"hello")
@@ -199,30 +264,15 @@ class SessionTests(unittest.TestCase):
 
 
 class HandshakeIntegrationTests(unittest.TestCase):
-    def test_server_rejects_unbound_legacy_client_hello(self):
-        ca_cert, server_key, server_cert, _, _ = make_certificates()
-        server_socket, client_socket = socket.socketpair()
-        try:
-            client_socket.sendall(server.pack(b"CLIENTHELLO|" + os.urandom(48)))
-            with self.assertRaises(server.ProtocolError):
-                server.server_handshake(
-                    server_socket,
-                    ("local", 0),
-                    server_key,
-                    server_cert,
-                    ca_cert,
-                )
-        finally:
-            server_socket.close()
-            client_socket.close()
-
-    def test_client_and_server_complete_sc_ee_3_handshake(self):
+    def _complete_handshake(self, cipher_suite):
         ca_cert, server_key, server_cert, client_key, client_cert = make_certificates()
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
         outcome = {}
+        client_aead = mock.Mock(wraps=client.create_aead)
+        server_aead = mock.Mock(wraps=server.create_aead)
 
         def accept_connection():
             connection, address = listener.accept()
@@ -239,26 +289,88 @@ class HandshakeIntegrationTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        worker = threading.Thread(target=accept_connection)
-        worker.start()
+        client_hello_prefix = (
+            b"CLIENTHELLO|" + client.PROTO_VER + b"|" + cipher_suite + b"|"
+        )
+        server_hello_prefix = (
+            b"SERVERHELLO|" + client.PROTO_VER + b"|" + cipher_suite + b"|"
+        )
         environment = {
             "SC_SERVER_NAME": "Sovereign-Chain-Server",
             "SC_ALLOWED_CLIENT_NAMES": "Sovereign-Chain-Client",
         }
         try:
-            with mock.patch.dict(os.environ, environment, clear=False), \
-                    mock.patch.object(client, "load_priv", return_value=client_key), \
-                    mock.patch.object(client, "load_cert", return_value=client_cert), \
-                    mock.patch.object(client, "load_ca_cert", return_value=ca_cert):
-                client_session, client_socket = client.client_handshake("127.0.0.1", port)
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.multiple(
+                    client,
+                    CIPHER_SUITE=cipher_suite,
+                    CLIENT_HELLO_PREFIX=client_hello_prefix,
+                    SERVER_HELLO_PREFIX=server_hello_prefix,
+                    create_aead=client_aead,
+                ),
+                mock.patch.multiple(
+                    server,
+                    CIPHER_SUITE=cipher_suite,
+                    CLIENT_HELLO_PREFIX=client_hello_prefix,
+                    SERVER_HELLO_PREFIX=server_hello_prefix,
+                    create_aead=server_aead,
+                ),
+                mock.patch.object(
+                    client,
+                    "load_client_credentials",
+                    return_value=(client_key, client_cert, ca_cert),
+                ),
+            ):
+                worker = threading.Thread(target=accept_connection)
+                worker.start()
+                client_session, client_socket = client.client_handshake(
+                    "127.0.0.1", port
+                )
                 client_socket.close()
-            worker.join(timeout=5)
+                worker.join(timeout=5)
             self.assertFalse(worker.is_alive())
             self.assertNotIn("error", outcome)
-            self.assertEqual(client_session.send_seq, 1)
-            self.assertEqual(outcome["session"].recv_seq, 1)
+            return client_session, outcome["session"], client_aead, server_aead
         finally:
             listener.close()
+
+    def test_server_rejects_unbound_legacy_client_hello(self):
+        ca_cert, server_key, server_cert, _, _ = make_certificates()
+        server_socket, client_socket = socket.socketpair()
+        try:
+            client_socket.sendall(pack(b"CLIENTHELLO|" + os.urandom(48)))
+            with self.assertRaises(server.ProtocolError):
+                server.server_handshake(
+                    server_socket,
+                    ("local", 0),
+                    server_key,
+                    server_cert,
+                    ca_cert,
+                )
+        finally:
+            server_socket.close()
+            client_socket.close()
+
+    def test_client_and_server_complete_sc_ee_3_handshake(self):
+        client_session, server_session, client_aead, server_aead = (
+            self._complete_handshake(client.CIPHER_SUITE)
+        )
+        self.assertEqual(client_session.send_seq, 1)
+        self.assertEqual(server_session.recv_seq, 1)
+        self.assertEqual(client_aead.call_args.args[1], client.CIPHER_SUITE)
+        self.assertEqual(server_aead.call_args.args[1], server.CIPHER_SUITE)
+
+    def test_aes_suite_protects_seed_stage_and_session(self):
+        client_session, server_session, client_aead, server_aead = (
+            self._complete_handshake(AES256_GCM_SIV_SUITE)
+        )
+        self.assertEqual(client_session.cipher_suite, AES256_GCM_SIV_SUITE)
+        self.assertEqual(server_session.cipher_suite, AES256_GCM_SIV_SUITE)
+        client_aead.assert_called_once()
+        server_aead.assert_called_once()
+        self.assertEqual(client_aead.call_args.args[1], AES256_GCM_SIV_SUITE)
+        self.assertEqual(server_aead.call_args.args[1], AES256_GCM_SIV_SUITE)
 
 
 if __name__ == "__main__":

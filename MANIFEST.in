@@ -1,0 +1,5 @@
+include README.md LICENSE
+include docs/*.md
+include tools/verify_dist.py
+include tests/test_*.py
+global-exclude *.pem *.key *.pfx *.p12 *.exe *.dll *.zip *.rar *.py[cod]

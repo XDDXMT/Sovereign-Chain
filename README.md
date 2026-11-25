@@ -1,291 +1,99 @@
-# 天启御链 / Sovereign-Chain
+# 天启御链 · Sovereign-Chain
 
-**Sovereign-Chain**（中文名：天启御链）是一套**端到端加密通信系统**，基于 TCP 实现，支持握手优化、证书认证、AEAD 加密和创新的种子码消息级动态加密。
-本项目适合教育、研究和高安全需求场景演示。
+Sovereign-Chain 用证书验证 TCP 连接两端的身份，再用 SC-EE-3 加密传输数据。可以直接运行加密回显示例，也可以给已有 TCP 服务接上一对代理。本整理版的软件包版本为 `2.1.0.dev0`。
 
----
+## 三步跑通加密回显
 
-## 特性
+以下命令在 Windows PowerShell 中执行，需要 Python 3.10 或更高版本。示例使用 3.13。
 
-* 🔐 **端到端加密（E2EE）**
+**1. 在项目根目录安装。**
 
-  * 使用 X25519 进行临时密钥交换
-  * 使用 Ed25519 静态密钥进行身份签名
-  * 使用 ChaCha20-Poly1305 进行 AEAD 加密
-  * 使用 HKDF-SHA256 派生会话密钥
-* ⚡ **安全加固握手协议（SC-EE-3）**
-
-  * 握手延迟从 2000ms 优化到 500-800ms
-  * 网络往返次数减少 50%
-  * 协议版本和密码套件显式绑定，拒绝旧协议降级
-  * 异步计算和预计算优化
-  
-* ✨ **优化七次握手**（Client ↔ Server）
-
-  1. **ClientHello**：客户端发送临时公钥和随机数 (client_eph_pub || nonce_c)
-  2. **ServerCombined**：服务端合并发送 ServerHello、ServerCertSend、ClientCertRequest
-  3. **ClientCertSend**：客户端发送证书 (client_cert in PEM)
-  4. **SeedCodeAndKeys**：服务端合并发送加密的种子码和预计算的密钥交换/确认数据
-  5. **ClientAuth**：客户端发送握手记录签名 (signature_client(transcript_so_far))
-  6. **ServerAuth**：服务端发送握手记录签名 (signature_server(transcript_so_far))
-  7. **SecureAck**：服务端发送加密的ACK（使用派生的密钥，证明密钥确认）
-
-* 🛡️ **证书管理**
-
-  * 自建 CA（根 CA）
-  * 服务端 / 客户端证书签发
-  * 握手中双方证书验证与签名验证
-  * 匿名证书仅作为显式启用的兼容模式，默认关闭
-* ⚡ **高安全性**
-
-  * HKDF-SHA256 派生会话密钥
-  * 独立的客户端-服务端、服务端-客户端对称密钥
-  * 防重放和防篡改设计
-  * 异步证书验证和密钥计算
-* 🔁 **中转代理（Proxy）支持**
-
-  * `client_proxy.py` 和 `server_proxy.py` 可在客户端和真实服务器之间作为中转
-  * 完整支持握手和加密通信
-  * 支持透明数据转发，客户端无需修改原逻辑即可接入代理
-  * 可用于负载分发、调试或隐藏真实服务器地址
-* 🌱 **种子码消息级动态加密（创新）**
-
-  * 在握手阶段传输64字节种子码
-  * 每条消息使用种子码+计数器派生独立密钥
-  * 实现真正的消息级安全隔离
-  * 使用单向密钥棘轮更新链密钥，不长期缓存旧共享秘密
-  * 在每条明文的随机位置插入种子码绑定填充
-  * 使用短随机填充，使相同消息产生不同长度的密文
-* 🔄 **异步优化**
-
-  * 使用线程池进行并行计算
-  * 异步密钥计算和证书验证
-  * 动态超时控制
-  * 合并消息发送，减少网络往返
-
----
-
-## 性能对比
-
-| 特性 | 原始版本 (SC-EE-1) | 优化版本 (SC-EE-2) | 提升 |
-|------|-------------------|-------------------|------|
-| 握手步骤 | 13步 | 7步 | 减少46% |
-| 握手延迟 | ~2000ms | ~500-800ms | 减少60-75% |
-| 网络往返 | 6-7次 | 3-4次 | 减少50% |
-| 计算开销 | 串行计算 | 并行异步计算 | 提升300% |
-| 消息数量 | 13条 | 7条 | 减少46% |
-| 超时时间 | 30秒 | 15秒 | 减少50% |
-
----
-
-## 文件结构
-
-```
-.
-├── ca.py            # 证书签发端 (生成 CA、server、client 证书)
-├── server.py        # 服务端 (优化版)
-├── client.py        # 客户端 (优化版)
-├── client_proxy.py  # 客户端中转代理
-├── server_proxy.py  # 代理服务端
-├── ca_cert.pem      # CA 根证书
-├── ca_key.pem       # CA 私钥
-├── server_cert.pem  # 服务端证书
-├── server_key.pem   # 服务端私钥
-├── client_cert.pem  # 客户端证书
-└── client_key.pem   # 客户端私钥
+```powershell
+Set-Location G:\Sovereign-Chain
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
----
+**2. 生成一套新证书并启动服务端。**
 
-## 快速开始
-
-### 1. 生成证书
-
-```bash
-python ca.py
+```powershell
+.\.venv\Scripts\python.exe -m sovereign_chain init-pki
+.\.venv\Scripts\python.exe -m sovereign_chain server
 ```
 
-生成 CA 根证书和服务端/客户端证书。
+首次初始化会提示设置 CA 私钥口令，默认输出在用户主目录的 `.sovereign-chain/pki`。已有目录会受到覆盖保护。同一套凭据只需初始化一次。服务端默认在 `127.0.0.1:5555` 等待。
 
-### 2. 启动服务端
+**3. 打开第二个 PowerShell，发送一条消息。**
 
-```bash
-python server.py
+```powershell
+Set-Location G:\Sovereign-Chain
+.\.venv\Scripts\python.exe -m sovereign_chain client --message "hello"
 ```
 
-监听 5555 端口，等待客户端连接。
+成功时会收到 `echo: hello`。省略 `--message` 可进入交互模式。服务端可用 Ctrl+C 停止。
 
-### 3. 启动客户端（直连服务端）
+## 接入已有 TCP 服务
 
-```bash
-python client.py
+以本机已有的 HTTP 服务 `127.0.0.1:8000` 为例。在两个终端分别从项目根目录运行下面的命令，保持两个代理运行。
+
+```powershell
+.\.venv\Scripts\python.exe -m sovereign_chain server-proxy --target-port 8000
 ```
 
-客户端会与服务端完成七次握手，建立安全通道，然后可发送加密消息。
-
-### 4. 使用代理模式（中转）
-
-启动代理服务端
-
-```bash
-python server_proxy.py
-```
-启动客户端代理
-```bash
-python client_proxy.py
+```powershell
+.\.venv\Scripts\python.exe -m sovereign_chain client-proxy
 ```
 
-客户端会与代理完成握手，代理再与真实服务器完成握手，中转模式下依然保持端到端加密。
-
-### 优化握手示意图
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server
-
-    Note over Client, Server: 天启御链优化加密握手步骤 (7步)
-    Note over Client, Server: 协议版本: SC-EE-3, 握手延迟: 500-800ms
-
-    Client->>Server: 1. CLIENTHELLO (client_eph_pub, nonce_c)
-    Server->>Client: 2. SERVER_COMBINED (合并发送)
-    Note over Server: ServerHello + ServerCertSend + ClientCertRequest
-    Client->>Server: 3. CLIENTCERTSEND (client_cert PEM)
-    Server->>Client: 4. SEEDCODE_AND_KEYS (合并发送)
-    Note over Server: 加密SeedCode + 预计算KeyExchange1/2 + KeyConfirm1/2
-    Client->>Server: 5. CLIENTAUTH (signature over transcript)
-    Server->>Client: 6. SERVERAUTH (signature over transcript)
-    Server->>Client: 7. SECUREACK (encrypted ACK)
-
-    Note over Client, Server: 安全通信通道建立完成
-    Client->>Server: DATA (加密应用数据)
-    Server->>Client: DATA (加密应用数据)
-```
-
----
-
-## 使用示例
-
-```
-msg> hello server
-server: echo: hello server
-
-msg> test123
-server: echo: test123
-```
-
-所有消息都经过端到端加密和种子码二次加密，服务端无法篡改内容，客户端与服务端可互相验证身份。
-在代理模式下，客户端与真实服务器之间仍保持完整加密和身份验证。
-
----
-
-## 安全设计说明
-
-1. **优化七次握手**确保双方身份验证和密钥确认：
-
-   * 步骤1：客户端发送临时公钥和随机数
-   * 步骤2：服务端合并发送临时公钥、证书和证书请求
-   * 步骤3：客户端发送证书
-   * 步骤4：服务端合并发送加密种子码和预计算的密钥材料
-   * 步骤5：客户端身份认证（签名验证握手完整性）
-   * 步骤6：服务端身份认证（签名验证握手完整性）
-   * 步骤7：加密确认（证明密钥已正确安装）
-
-2. **异步优化**：
-
-   * 密钥计算和证书验证在独立线程池中进行
-   * 动态超时控制，防止资源耗尽
-   * 预计算共享密钥，减少等待时间
-
-3. **会话密钥派生**：
-
-   * 使用 X25519 生成共享密钥
-   * 通过 HKDF-SHA256 派生两个独立密钥：
-     * 客户端→服务端加密密钥
-     * 服务端→客户端加密密钥
-
-4. **种子码动态加密（创新）**：
-   * 每条消息使用种子码+计数器派生独立密钥
-   * 实现真正的消息级安全隔离
-   * 每次成功处理消息后单向推进链密钥，降低当前状态泄露对历史消息的影响
-   * 填充内容由种子码、序列号、方向标签和随机 nonce 派生
-   * 插入位置和短填充长度独立随机，兼顾流量混淆与传输效率
-   * 填充封装由 AEAD 一并认证，接收端严格验证长度和填充内容
-   * 破解单条消息不影响其他消息安全
-
-5. **加密与认证**：
-
-   * 使用 ChaCha20-Poly1305 进行 AEAD 加密
-   * 每条消息包含唯一序列号防止重放攻击
-   * 握手记录签名防止篡改
-
-6. **证书体系**：
-
-   * 自签名 CA 根证书
-   * 服务端/客户端证书包含 Ed25519 公钥
-   * 握手中验证证书链和签名
-   * 匿名证书模式默认关闭，仅用于显式启用的兼容测试
-
-7. **中转代理设计**：
-
-   * 客户端通过代理与真实服务器通信
-   * 代理完成独立握手并保持端到端加密
-   * 支持双向加密转发，确保数据安全与完整性
-   * 可用于调试、负载分发或隐藏服务器 IP
-
-8. **性能与安全平衡**：
-   * 合并消息减少网络往返
-   * 保持与旧版本的安全性相同
-   * 异步计算提高并发性能
-   * 动态超时防止资源耗尽攻击
-
----
-
-## 协议兼容性
-
-安全加固版本只接受明确绑定协议版本和密码套件的 SC-EE-3 握手。客户端、服务端和代理必须同步升级；旧版握手会被拒绝，以避免协议降级和填充格式混淆。
-
-升级后需要重新运行 `python ca.py`，生成包含 SAN 和 EKU 约束的新证书；旧版缺少这些扩展的终端证书会被拒绝。
-
-## 安全配置
-
-默认服务端身份是 `Sovereign-Chain-Server`，默认允许的客户端身份是 `Sovereign-Chain-Client`。部署时可通过环境变量覆盖：
+现在访问 `http://127.0.0.1:3398/` 就会经过隧道抵达该 HTTP 服务。默认拓扑如下。
 
 ```text
-SC_SERVER_NAME=服务端证书中的SAN名称
-SC_ALLOWED_CLIENT_NAMES=允许的客户端SAN名称，多个名称用逗号分隔
-SC_CRL_FILE=可信CA发布的PEM或DER格式CRL文件
-SC_REQUIRE_CRL=1
-SC_CA_CERT_FILE=受控目录中的CA证书
-SC_SERVER_CERT_FILE=受控目录中的服务端证书
-SC_SERVER_KEY_FILE=受控目录中的服务端私钥
-SC_SERVER_KEY_PASSWORD=加密PEM私钥的密码
-SC_CLIENT_CERT_FILE=受控目录中的客户端证书
-SC_CLIENT_KEY_FILE=受控目录中的客户端私钥
-SC_CLIENT_KEY_PASSWORD=加密PEM私钥的密码
-SC_MIN_PADDING_BYTES=0
-SC_MAX_PADDING_BYTES=32
+应用 → 本地代理 :3398  ═══ SC-EE-3 加密 TCP ═══  远端代理 :25558 → 目标服务 :8000
 ```
 
-生产环境建议同时设置 `SC_CRL_FILE` 和 `SC_REQUIRE_CRL=1`，使吊销信息不可用时连接直接失败。匿名客户端默认禁用；仅兼容测试可设置 `SC_ALLOW_ANONYMOUS_CLIENTS=1`，不得向普通客户端分发匿名 CA 私钥。
+两个代理都能看到交付给应用的字节。代理与应用之间的链路由应用协议自行保护。跨机器时，服务端代理用 `--listen-host` 绑定目标网卡，客户端代理用 `--remote-host` 指向它。每个命令的 `--help` 可查看参数。
 
-代理地址可通过 `SC_CLIENT_PROXY_*`、`SC_SERVER_HOST`、`SC_SERVER_PORT` 和 `SC_PROXY_*` 环境变量配置。
+## 配置
 
-## 测试
+地址参数优先于环境变量。默认监听 IPv4 回环地址。证书路径和套件在启动相应进程前设置。
 
-```bash
-python -m unittest discover -s tests -v
+| 用途 | 配置与默认值 |
+| --- | --- |
+| 直连服务端监听 | `SC_LISTEN_HOST`、`SC_LISTEN_PORT`，默认 `127.0.0.1:5555` |
+| 客户端连接对端 | `SC_SERVER_HOST`、`SC_SERVER_PORT`，直连默认端口 5555，客户端代理默认 25558 |
+| 客户端代理入口 | `SC_CLIENT_PROXY_LISTEN_HOST`、`SC_CLIENT_PROXY_LISTEN_PORT`，默认 `127.0.0.1:3398` |
+| 服务端代理入口与目标 | `SC_PROXY_LISTEN_HOST`、`SC_PROXY_LISTEN_PORT` 默认 `127.0.0.1:25558`，`SC_PROXY_TARGET_HOST`、`SC_PROXY_TARGET_PORT` 默认 `127.0.0.1:8000` |
+| 并发连接 | `--max-connections` 或 `SC_MAX_CONNECTIONS`，每个监听进程默认 64 |
+| 凭据与身份 | `SC_PKI_DIR` 为包含角色子目录的目录。`SC_SERVER_NAME` 默认 `Sovereign-Chain-Server`，`SC_ALLOWED_CLIENT_NAMES` 默认 `Sovereign-Chain-Client`，多个客户端名称用逗号分隔 |
+| 密码套件 | `SC_CIPHER_SUITE` 默认 `CHACHA20-POLY1305`，也可选 `AES-256-GCM-SIV`，两端须一致 |
+| 消息填充 | `SC_MIN_PADDING_BYTES`、`SC_MAX_PADDING_BYTES` 默认 0 和 32，协议允许的最大值为 256 |
+
+`init-pki --out` 仅选择生成位置。自定义位置后，各终端通过 `SC_PKI_DIR` 指向相应目录。分机部署、私钥口令、吊销配置及旧凭据处置见 [安全说明](docs/security.md)。
+
+## 目录
+
+```text
+src/sovereign_chain/
+  __main__.py                五个命令及加密回显示例
+  client.py、server.py       两端握手
+  handshake.py、wire.py      共享密钥派生、握手记录和 TCP 帧
+  security.py                证书验证、双向会话、认证加密和填充
+  credentials.py、pki.py     角色凭据加载和首次签发
+  service.py、proxy.py       有界监听、停止和双向转发
+tests/                       协议、安全、代理生命周期及打包策略测试
+docs/                        协议流程和安全边界
+tools/verify_dist.py         检查 wheel 和源码包内容
+.github/workflows/ci.yml     Windows / Linux 自动测试及构建
+pyproject.toml、MANIFEST.in   依赖、入口及包内容规则
+dist/                        本次构建的 wheel 和源码包
 ```
 
----
+## 测试与打包
 
-## 依赖
-
-```bash
-pip install cryptography
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pip install build
+.\.venv\Scripts\python.exe -m build
+.\.venv\Scripts\python.exe tools\verify_dist.py dist
 ```
 
----
-
-## 更新日志
-详细更新记录：./update_log.md
+检查器会打开生成的两个包，验证成员白名单并检查私钥 PEM 标记。安装已构建的 wheel 也可以直接使用 `sovereign-chain` 命令。握手顺序、密钥演进、代理关闭语义见 [协议说明](docs/protocol.md)。项目保留原始 [许可证](LICENSE)。
