@@ -31,9 +31,11 @@ jobs:
       - name: Test installed package
         run: python -m unittest discover -s tests -v
 
-      - name: Prepare trusted distribution archive
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
-        run: python tools/verify_dist.py dist > SHA256SUMS
+      - name: Prepare and verify portable SHA256SUMS
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: |
+          python tools/verify_dist.py dist > SHA256SUMS
+          (cd dist && sha256sum --check ../SHA256SUMS)
       - name: Retain verified release files
         if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

@@ -397,6 +397,21 @@ class DeploymentTests(unittest.TestCase):
             finally:
                 release_target.set()
 
+    def test_stopping_active_proxy_does_not_signal_successful_eof(self):
+        store = self.new_store("server", self.primary)
+        with running(echo_handler(store), stores=(store,)) as remote:
+            with running(
+                client_proxy_handler(remote.address, trusted_loopback=True)
+            ) as local:
+                with socket.create_connection(local.address, timeout=3) as app:
+                    app.sendall(b"alive")
+                    self.assertEqual(recv_exact(app, 11), b"echo: alive")
+                    local.stop()
+                    with self.assertRaises(
+                        (ConnectionResetError, ConnectionAbortedError)
+                    ):
+                        app.recv(1)
+
     def test_remote_close_without_fin_aborts_plain_tcp(self):
         creds = self.new_store("server", self.primary).current()
 

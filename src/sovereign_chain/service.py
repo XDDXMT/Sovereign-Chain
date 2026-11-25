@@ -55,6 +55,7 @@ class Connection:
         self.lock = threading.Lock()
         self.sockets = {sock}
         self.closed = False
+        self.abort_on_stop = False
 
     def limit_to(self, expiry):
         remaining = (
@@ -108,7 +109,7 @@ class TCPService:
         with self.lock:
             connections = list(self.workers.values())
         for connection in connections:
-            connection.close(abort=abort)
+            connection.close(abort=abort or connection.abort_on_stop)
 
     def stop(self):
         self.stopping.set()

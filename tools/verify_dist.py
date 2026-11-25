@@ -202,7 +202,7 @@ def verify(directory):
     _metadata(sf[f"{RELEASE}/src/{NAME}.egg-info/PKG-INFO"])
     _entry_points(sf[f"{RELEASE}/src/{NAME}.egg-info/entry_points.txt"])
     for artifact in (wheel, source):
-        print(hashlib.sha256(artifact.read_bytes()).hexdigest(), artifact.name)
+        print(f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  {artifact.name}")
 
 
 if __name__ == "__main__":

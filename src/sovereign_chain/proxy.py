@@ -249,6 +249,7 @@ def client_proxy_handler(
         )
 
     def handle(connection, local, address):
+        connection.abort_on_stop = True
         local_session = None
         if trusted_loopback:
             if not (loopback(local.getsockname()[0]) and loopback(address[0])):
@@ -275,6 +276,7 @@ def client_proxy_handler(
 
 def server_proxy_handler(target, credentials):
     def handle(connection, tunnel, address):
+        connection.abort_on_stop = True
         session = accept_session(connection, tunnel, address, credentials)
         with connection.own(socket.create_connection(target, timeout=10)) as plain:
             relay(connection, Endpoint(plain, None), Endpoint(tunnel, session))
