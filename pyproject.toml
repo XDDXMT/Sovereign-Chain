@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sovereign-chain"
-version = "2.1.0.dev0"
+version = "2.1.0.dev1"
 description = "SC-EE-3 mutually authenticated TCP sessions and bounded TCP relays"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = ["cryptography>=42.0.0"]
+requires-python = ">=3.11"
+dependencies = ["cryptography>=50.0.2"]
 license-files = ["LICENSE"]
 
 [project.scripts]

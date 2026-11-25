@@ -5,16 +5,80 @@ permissions:
 jobs:
   verify:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python: ['3.10', '3.13']
+        python: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e . build
-      - run: python -m unittest discover -s tests -v
-      - run: python -m build
-      - run: python tools/verify_dist.py dist
+      - name: Install hash-verified runtime and build dependencies
+        run: >-
+          python -m pip install --only-binary=:all: --require-hashes
+          -r requirements/runtime.lock -r requirements/build.lock
+      - name: Build wheel from source distribution
+        run: python -m build --no-isolation
+      - name: Verify inventory, RECORD, metadata and source contents
+        run: python tools/verify_dist.py dist
+      - name: Install the verified wheel
+        run: python -c "from pathlib import Path; import subprocess,sys; subprocess.run([sys.executable,'-m','pip','install','--no-index','--no-deps',str(next(Path('dist').glob('*.whl')))],check=True)"
+      - name: Test installed package
+        run: python -m unittest discover -s tests -v
+
+      - name: Prepare and verify portable SHA256SUMS
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: |
+          python tools/verify_dist.py dist > SHA256SUMS
+          (cd dist && sha256sum --check ../SHA256SUMS)
+      - name: Retain verified release files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: verified-distributions
+          if-no-files-found: error
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            SHA256SUMS
+
+  dependency-audit:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - run: >-
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/audit.lock
+      - run: python -m pip_audit --strict --require-hashes --disable-pip -r requirements/runtime.lock -r requirements/build.lock
+
+  provenance:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [verify, dependency-audit]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: verified-distributions
+      - name: Match the verified checksums
+        working-directory: dist
+        run: sha256sum --check ../SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*

@@ -29,7 +29,7 @@ def recv_exact(sock, count, deadline=None):
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("handshake deadline exceeded")
+                raise TimeoutError("network read/write deadline exceeded")
             sock.settimeout(remaining)
         part = sock.recv(min(count - len(result), 65536))
         if not part:
@@ -66,7 +66,7 @@ class HandshakeIO:
     def send(self, *frames):
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("handshake deadline exceeded")
+            raise TimeoutError("network read/write deadline exceeded")
         self.sock.settimeout(remaining)
         self.sock.sendall(b"".join(pack(frame) for frame in frames))
         for frame in frames:
@@ -82,14 +82,24 @@ def payload(frame, prefix, size=None):
     return body
 
 
-def send_record(sock, session, data, kind=DATA):
+def encode_record(session, data, kind=DATA):
     sequence, ciphertext = session.encrypt_with_sequence(data, frame_type=kind)
-    sock.sendall(pack(kind + SEQUENCE.pack(sequence) + ciphertext))
+    size = len(kind) + SEQUENCE.size + len(ciphertext)
+    if size > MAX_FRAME_SIZE:
+        raise ProtocolError("frame exceeds size limit")
+    return b"".join((LENGTH.pack(size), kind, SEQUENCE.pack(sequence), ciphertext))
 
 
-def receive_record(sock, session):
-    frame = recv_frame(sock)
-    kind = frame[:4]
+def send_record(sock, session, data, kind=DATA):
+    sock.sendall(encode_record(session, data, kind))
+
+
+def receive_record(sock, session, deadline=None):
+    return decode_record(session, recv_frame(sock, deadline))
+
+
+def decode_record(session, frame):
+    kind = bytes(frame[:4])
     if kind not in (DATA, FIN) or len(frame) < 12:
         raise ProtocolError("invalid application record")
     (sequence,) = SEQUENCE.unpack_from(frame, 4)
