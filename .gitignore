@@ -9,3 +9,7 @@ dist/
 *.pfx
 *.p12
 .env
+
+# Private local audit dashboard and findings
+/audit/
+.ruff_cache/

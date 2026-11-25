@@ -16,8 +16,8 @@ from sovereign_chain.service import TCPService
 
 
 @contextmanager
-def running(handler, limit=4):
-    service = TCPService(("127.0.0.1", 0), handler, limit)
+def running(handler, limit=4, **options):
+    service = TCPService(("127.0.0.1", 0), handler, limit, **options)
     thread = threading.Thread(target=service.serve, daemon=True)
     thread.start()
     try:
@@ -101,7 +101,7 @@ class PKIAndRelayTests(unittest.TestCase):
                 running(server_proxy_handler(target.address, server_credentials()))
             )
             sender = stack.enter_context(
-                running(client_proxy_handler(receiver.address))
+                running(client_proxy_handler(receiver.address, trusted_loopback=True))
             )
             with socket.create_connection(sender.address, timeout=5) as app:
                 app.sendall(data)
@@ -124,7 +124,7 @@ class PKIAndRelayTests(unittest.TestCase):
                 running(server_proxy_handler(target.address, server_credentials()))
             )
             sender = stack.enter_context(
-                running(client_proxy_handler(receiver.address))
+                running(client_proxy_handler(receiver.address, trusted_loopback=True))
             )
             with socket.create_connection(sender.address, timeout=5) as app:
                 self.assertEqual(read_to_eof(app), b"ready")

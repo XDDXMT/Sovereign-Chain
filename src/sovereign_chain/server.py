@@ -21,30 +21,37 @@ from .security import (
     hkdf,
     validate_peer_certificate,
 )
-from .wire import HandshakeIO, ProtocolError, payload
+from .trust import FROM_ENV, require_identity
+from .wire import HandshakeIO, payload
+from .wire import ProtocolError as ProtocolError
 
 CLIENT_HELLO_PREFIX = b"CLIENTHELLO|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|"
 SERVER_HELLO_PREFIX = b"SERVERHELLO|" + PROTO_VER + b"|" + CIPHER_SUITE + b"|"
 client_nonces = ReplayWindow()
 
 
-def authorized_certificate(pem, anchor):
+def authorized_certificate(pem, anchor, names=None, revocations=FROM_ENV):
     cert = x509.load_pem_x509_certificate(pem)
-    validate_peer_certificate(cert, anchor, "client")
-    allowed = {
-        name.strip().casefold()
-        for name in os.getenv("SC_ALLOWED_CLIENT_NAMES", CLIENT_NAME).split(",")
-        if name.strip()
-    }
-    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    names = {name.casefold() for name in san.get_values_for_type(x509.DNSName)}
-    names.update(str(ip) for ip in san.get_values_for_type(x509.IPAddress))
-    if not allowed.intersection(names):
-        raise ProtocolError("client identity is not authorized")
+    validate_peer_certificate(cert, anchor, "client", revocations=revocations)
+    allowed = (
+        os.getenv("SC_ALLOWED_CLIENT_NAMES", CLIENT_NAME).split(",")
+        if names is None
+        else names
+    )
+    require_identity(cert, allowed)
     return cert
 
 
-def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
+def server_handshake(
+    conn,
+    addr,
+    server_priv,
+    server_cert,
+    ca_cert,
+    *,
+    allowed_names=None,
+    revocations=FROM_ENV,
+):
     """The caller owns conn on both success and failure."""
     stream = HandshakeIO(conn)
     hello = payload(stream.receive(), CLIENT_HELLO_PREFIX, 48)
@@ -59,7 +66,10 @@ def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
     )
     shared = ephemeral.exchange(x25519.X25519PublicKey.from_public_bytes(hello[:32]))
     client_cert = authorized_certificate(
-        payload(stream.receive(), b"CLIENTCERTSEND|"), ca_cert
+        payload(stream.receive(), b"CLIENTCERTSEND|"),
+        ca_cert,
+        allowed_names,
+        revocations,
     )
     context = key_context(CIPHER_SUITE, client_nonce, server_nonce)
     prior = stream.digest.digest()
@@ -84,5 +94,6 @@ def server_handshake(conn, addr, server_priv, server_cert, ca_cert):
     )
     ack = session.encrypt(b"ACK", aad=transcript, frame_type=b"SECUREACK")
     stream.send(b"SECUREACK|" + ack)
+    session.peer_expires = client_cert.not_valid_after_utc
     conn.settimeout(None)
     return session
